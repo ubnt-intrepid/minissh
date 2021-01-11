@@ -1,0 +1,16 @@
+[package]
+name = "minissh"
+version = "0.0.1-dev"
+publish = false
+authors = ["Yusuke Sasaki <yusuke.sasaki.nuem@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+byteorder = "1"
+bytes = "1"
+ring = "0.16"
+tracing = "0.1"
+
+[dev-dependencies]
+anyhow = "1"
+tracing-subscriber = "0.1"
