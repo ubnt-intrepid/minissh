@@ -12,9 +12,8 @@ use futures::{
 };
 use ring::{aead::chacha20_poly1305_openssh as aead, agreement, digest, rand, signature};
 use std::{convert::TryInto as _, io, num, pin::Pin};
-use tokio::{
-    io::{AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader, ReadBuf},
-    net::{TcpStream, ToSocketAddrs},
+use tokio::io::{
+    AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader, ReadBuf,
 };
 
 // defined in https://git.libssh.org/projects/libssh.git/tree/doc/curve25519-sha256@libssh.org.txt#n62
@@ -23,21 +22,10 @@ const CURVE25519_SHA256: &str = "curve25519-sha256@libssh.org";
 // defined in http://cvsweb.openbsd.org/cgi-bin/cvsweb/src/usr.bin/ssh/PROTOCOL.chacha20poly1305?rev=1.5&content-type=text/x-cvsweb-markup
 const CHACHA20_POLY1305: &str = "chacha20-poly1305@openssh.com";
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("ring error")]
-    Ring,
-    #[error("protocol error")]
-    Protocol,
-    #[error("I/O error")]
-    Transport(#[source] io::Error),
-}
-
-pub async fn connect<A>(addr: A) -> Result<Transport, Error>
+pub async fn establish<T>(stream: T) -> Result<Transport<T>, crate::Error>
 where
-    A: ToSocketAddrs,
+    T: AsyncRead + AsyncWrite + Unpin,
 {
-    let stream = TcpStream::connect(addr).await.map_err(Error::Transport)?;
     let mut stream = BufReader::new(stream);
 
     tracing::debug!("Exchange SSH identifiers");
@@ -48,13 +36,13 @@ where
         .get_mut()
         .write_all(&client_id[..])
         .await
-        .map_err(Error::Transport)?;
+        .map_err(crate::Error::io)?;
     stream
         .get_mut()
         .write_all(b"\r\n")
         .await
-        .map_err(Error::Transport)?;
-    stream.get_mut().flush().await.map_err(Error::Transport)?;
+        .map_err(crate::Error::io)?;
+    stream.get_mut().flush().await.map_err(crate::Error::io)?;
 
     let server_id = {
         let mut line = vec![];
@@ -62,7 +50,7 @@ where
             let _amt = stream
                 .read_until(b'\n', &mut line)
                 .await
-                .map_err(Error::Transport)?;
+                .map_err(crate::Error::io)?;
             if line.starts_with(b"SSH-") {
                 break;
             }
@@ -81,7 +69,7 @@ where
         String::from_utf8_lossy(&server_id)
     );
 
-    Ok(Transport {
+    let mut transport = Transport {
         stream,
         state: TransportState::Init,
         send: SendPacket::default(),
@@ -90,13 +78,19 @@ where
         opening_key: Box::new(ClearText),
         sealing_key: Box::new(ClearText),
         session_id: None,
-    })
+    };
+
+    tracing::trace!("Handshake");
+    futures::future::poll_fn(|cx| transport.poll_handshake(cx)).await?;
+    tracing::trace!("--> Done");
+
+    Ok(transport)
 }
 
 // ==== Transport ====
 
-pub struct Transport {
-    stream: BufReader<TcpStream>,
+pub struct Transport<T> {
+    stream: BufReader<T>,
     state: TransportState,
     send: SendPacket,
     recv: RecvPacket,
@@ -112,8 +106,11 @@ enum TransportState {
     Ready,
 }
 
-impl Transport {
-    pub fn poll_handshake(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), Error>> {
+impl<T> Transport<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    pub fn poll_handshake(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
         let span = tracing::trace_span!("Transport::poll_handshake");
         let _enter = span.enter();
 
@@ -152,14 +149,19 @@ impl Transport {
         }
     }
 
-    pub fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<&[u8], Error>> {
+    pub fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
+        let span = tracing::trace_span!("Transport::poll_recv");
+        let _enter = span.enter();
+
         loop {
             match self.state {
                 TransportState::Init => panic!("transport is not initialized"),
                 TransportState::Kex => {
+                    tracing::trace!("--> Kex");
                     let _session_id = ready!(self.poll_kex(cx))?;
                 }
                 TransportState::Ready => {
+                    tracing::trace!("--> Ready");
                     ready!(self
                         .recv
                         .poll_recv(cx, &mut self.stream, &*self.opening_key))?;
@@ -171,7 +173,7 @@ impl Transport {
                         continue;
                     }
 
-                    return Poll::Ready(Ok(self.recv.payload()));
+                    return Poll::Ready(Ok(()));
                 }
             }
         }
@@ -189,17 +191,22 @@ impl Transport {
         &mut self,
         cx: &mut task::Context<'_>,
         payload: &mut B,
-    ) -> Poll<Result<(), Error>>
+    ) -> Poll<Result<(), crate::Error>>
     where
         B: Buf,
     {
+        let span = tracing::trace_span!("Transport::poll_send");
+        let _enter = span.enter();
+
         loop {
             match self.state {
                 TransportState::Init => panic!("transport is not initialized"),
                 TransportState::Kex => {
+                    tracing::trace!("--> Kex");
                     ready!(self.poll_kex(cx))?;
                 }
                 TransportState::Ready => {
+                    tracing::trace!("--> Ready");
                     ready!(self.send.poll_flush(cx, &mut self.stream))?;
                     self.send.fill_buf(payload, &*self.sealing_key)?;
                     return Poll::Ready(Ok(()));
@@ -208,11 +215,16 @@ impl Transport {
         }
     }
 
-    pub fn poll_flush(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), Error>> {
+    pub fn poll_flush(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
+        let span = tracing::trace_span!("Transport::poll_send");
+        let _enter = span.enter();
         self.send.poll_flush(cx, &mut self.stream)
     }
 
-    fn poll_kex(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<digest::Digest, Error>> {
+    fn poll_kex(
+        &mut self,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<digest::Digest, crate::Error>> {
         assert!(
             matches!(self.state, TransportState::Kex),
             "unexpected condition"
@@ -233,6 +245,10 @@ impl Transport {
         self.state = TransportState::Ready;
 
         Poll::Ready(Ok(exchange_hash))
+    }
+
+    pub fn session_id(&self) -> &[u8] {
+        self.session_id.as_ref().unwrap().as_ref()
     }
 }
 
@@ -261,7 +277,11 @@ impl Default for SendPacket {
 }
 
 impl SendPacket {
-    fn fill_buf<B>(&mut self, payload: &mut B, sealing_key: &dyn SealingKey) -> Result<(), Error>
+    fn fill_buf<B>(
+        &mut self,
+        payload: &mut B,
+        sealing_key: &dyn SealingKey,
+    ) -> Result<(), crate::Error>
     where
         B: Buf,
     {
@@ -299,7 +319,7 @@ impl SendPacket {
         {
             let (packet, tag) = self.buf.split_at_mut(4 + packet_length);
             assert_eq!(tag.len(), sealing_key.tag_len());
-            sealing_key.seal_in_place(0, packet, tag)?;
+            sealing_key.seal_in_place(self.seqn.0, packet, tag)?;
         }
 
         self.state = SendPacketState::Writing(0);
@@ -312,7 +332,7 @@ impl SendPacket {
         &mut self,
         cx: &mut task::Context<'_>,
         stream: &mut T,
-    ) -> Poll<Result<(), Error>>
+    ) -> Poll<Result<(), crate::Error>>
     where
         T: AsyncWrite + Unpin,
     {
@@ -325,7 +345,7 @@ impl SendPacket {
                     let mut buf = &self.buf[..];
                     while buf.has_remaining() {
                         let amt = ready!(stream.as_mut().poll_write(cx, buf.chunk()))
-                            .map_err(Error::Transport)?;
+                            .map_err(crate::Error::io)?;
                         buf.advance(amt);
                         *written += amt;
                     }
@@ -333,7 +353,7 @@ impl SendPacket {
                 }
 
                 SendPacketState::Flushing => {
-                    ready!(stream.as_mut().poll_flush(cx)).map_err(Error::Transport)?;
+                    ready!(stream.as_mut().poll_flush(cx)).map_err(crate::Error::io)?;
                     self.state = SendPacketState::Available;
                     return Poll::Ready(Ok(()));
                 }
@@ -374,7 +394,7 @@ impl RecvPacket {
         cx: &mut task::Context<'_>,
         stream: &mut T,
         opening_key: &dyn OpeningKey,
-    ) -> Poll<Result<(), Error>>
+    ) -> Poll<Result<(), crate::Error>>
     where
         T: AsyncRead + Unpin,
     {
@@ -384,14 +404,36 @@ impl RecvPacket {
         let mut stream = Pin::new(stream);
         loop {
             match self.state {
+                RecvPacketState::Decrypted => {
+                    tracing::trace!("--> Decrypted");
+                    unsafe {
+                        // zeroing previous cleartext.
+                        std::ptr::write_bytes(self.buf.as_mut_ptr(), 0, self.buf.len());
+                    }
+                    self.buf.resize(4, 0u8);
+                    self.state = RecvPacketState::ReadingLength(0);
+                }
+
                 RecvPacketState::ReadingLength(ref mut read) => {
+                    tracing::trace!("--> ReadingLength({})", read);
+
                     let mut read_buf = ReadBuf::new(&mut self.buf[..4]);
                     read_buf.set_filled(*read);
 
-                    while read_buf.remaining() > 0 {
-                        ready!(stream.as_mut().poll_read(cx, &mut read_buf))
-                            .map_err(Error::Transport)?;
-                        *read = read_buf.filled().len();
+                    loop {
+                        let rem = read_buf.remaining();
+                        if rem != 0 {
+                            ready!(stream.as_mut().poll_read(cx, &mut read_buf))
+                                .map_err(crate::Error::io)?;
+                            if read_buf.remaining() == rem {
+                                return Poll::Ready(Err(crate::Error::io(eof(
+                                    "unexpected eof during reading packet length",
+                                ))));
+                            }
+                            *read = read_buf.filled().len();
+                        } else {
+                            break;
+                        }
                     }
 
                     let encrypted_packet_length = &self.buf[..4];
@@ -406,16 +448,17 @@ impl RecvPacket {
                 }
 
                 RecvPacketState::ReadingPacket(ref mut read) => {
+                    tracing::trace!("--> ReadingPacket({})", read);
+
                     let mut read_buf = ReadBuf::new(&mut self.buf[..]);
                     read_buf.set_filled(*read);
 
                     while read_buf.remaining() > 0 {
                         ready!(stream.as_mut().poll_read(cx, &mut read_buf))
-                            .map_err(Error::Transport)?;
+                            .map_err(crate::Error::io)?;
                         *read = read_buf.filled().len();
                     }
 
-                    tracing::trace!("decrypt");
                     let (ciphertext, tag) = self.buf.split_at_mut(4 + self.packet_length as usize);
                     debug_assert_eq!(tag.len(), opening_key.tag_len());
                     opening_key.open_in_place(self.seqn.0, ciphertext, tag)?;
@@ -424,15 +467,6 @@ impl RecvPacket {
                     self.state = RecvPacketState::Decrypted;
 
                     return Poll::Ready(Ok(()));
-                }
-
-                RecvPacketState::Decrypted => {
-                    unsafe {
-                        // zeroed previous cleartext.
-                        std::ptr::write_bytes(self.buf.as_mut_ptr(), 0, self.buf.len());
-                    }
-                    self.buf.resize(4, 0u8);
-                    self.state = RecvPacketState::ReadingLength(0);
                 }
             }
         }
@@ -486,7 +520,7 @@ impl KeyExchange {
         }
     }
 
-    fn start_kex(&mut self, server_kexinit_payload: &[u8]) -> Result<(), Error> {
+    fn start_kex(&mut self, server_kexinit_payload: &[u8]) -> Result<(), crate::Error> {
         let span = tracing::trace_span!("start_kex");
         let _enter = span.enter();
 
@@ -509,9 +543,12 @@ impl KeyExchange {
         tracing::trace!("init ephemeral ECDH key");
         self.client_ephemeral_key = Some({
             let private_key =
-                agreement::EphemeralPrivateKey::generate(&agreement::X25519, &self.rng)
-                    .map_err(|_| Error::Ring)?;
-            let public_key = private_key.compute_public_key().map_err(|_| Error::Ring)?;
+                agreement::EphemeralPrivateKey::generate(&agreement::X25519, &self.rng).map_err(
+                    |_| crate::Error::transport("failed to generate ephemeral private key"),
+                )?;
+            let public_key = private_key
+                .compute_public_key()
+                .map_err(|_| crate::Error::transport("failed to compute ephemeral public key"))?;
             (private_key, public_key)
         });
 
@@ -537,7 +574,7 @@ impl KeyExchange {
         recv: &mut RecvPacket,
         opening_key: &dyn OpeningKey,
         sealing_key: &dyn SealingKey,
-    ) -> Poll<Result<(aead::OpeningKey, aead::SealingKey, digest::Digest), Error>>
+    ) -> Poll<Result<(aead::OpeningKey, aead::SealingKey, digest::Digest), crate::Error>>
     where
         T: AsyncRead + AsyncWrite + Unpin,
     {
@@ -582,7 +619,9 @@ impl KeyExchange {
                     let typ = payload.get_u8();
                     if typ != consts::SSH_MSG_KEX_ECDH_REPLY {
                         // TODO: set state
-                        return Poll::Ready(Err(Error::Protocol));
+                        return Poll::Ready(Err(crate::Error::transport(
+                            "reply is not ECDH_REPLY",
+                        )));
                     }
 
                     let server_host_key = {
@@ -598,7 +637,11 @@ impl KeyExchange {
                                 let key = get_ssh_string(&mut raw);
                                 signature::UnparsedPublicKey::new(&signature::ED25519, key)
                             }
-                            _ => return Poll::Ready(Err(Error::Protocol)),
+                            _ => {
+                                return Poll::Ready(Err(crate::Error::transport(
+                                    "unexpected server host key type",
+                                )))
+                            }
                         }
                     };
                     // TODO: verify server host key.
@@ -623,7 +666,11 @@ impl KeyExchange {
                                 // ref: https://tools.ietf.org/html/rfc8709#section-6
                                 get_ssh_string(&mut raw)
                             }
-                            _ => return Poll::Ready(Err(Error::Protocol)),
+                            _ => {
+                                return Poll::Ready(Err(crate::Error::transport(
+                                    "unexpected exchange hash signature type",
+                                )))
+                            }
                         }
                     };
 
@@ -631,7 +678,7 @@ impl KeyExchange {
                     agreement::agree_ephemeral(
                         client_private_key,
                         &server_public_key,
-                        Error::Ring,
+                        crate::Error::transport("errored during key agreement"),
                         {
                             let slot_out = &mut self.out;
                             move |secret| {
@@ -642,7 +689,9 @@ impl KeyExchange {
                                 };
                                 server_host_key
                                     .verify(exchange_hash.as_ref(), &exchange_hash_sig[..])
-                                    .map_err(|_| Error::Ring)?;
+                                    .map_err(|_| {
+                                        crate::Error::transport("exchange hash mismatched")
+                                    })?;
 
                                 tracing::trace!("calculate encryption keys");
                                 let sealing_key = compute_key(
@@ -699,7 +748,7 @@ impl KeyExchange {
                     let payload = recv.payload();
                     if payload.is_empty() || payload[0] != consts::SSH_MSG_NEWKEYS {
                         // TODO: send DISCONNECT
-                        return Poll::Ready(Err(Error::Protocol));
+                        return Poll::Ready(Err(crate::Error::transport("is not NEWKEYS")));
                     }
 
                     self.state = KeyExchangeState::Exchanged;
@@ -714,12 +763,12 @@ impl KeyExchange {
     }
 }
 
-fn client_kex_payload(rng: &rand::SystemRandom) -> Result<Vec<u8>, Error> {
+fn client_kex_payload(rng: &rand::SystemRandom) -> Result<Vec<u8>, crate::Error> {
     let mut payload = vec![];
     payload.put_u8(consts::SSH_MSG_KEXINIT);
 
     let cookie = ring::rand::generate::<[u8; 16]>(rng)
-        .map_err(|_| Error::Ring)?
+        .map_err(|_| crate::Error::transport("failed to generate random"))?
         .expose();
     payload.put_slice(&cookie[..]);
 
@@ -746,7 +795,7 @@ fn client_kex_payload(rng: &rand::SystemRandom) -> Result<Vec<u8>, Error> {
 
 // ==== ciphers ====
 
-pub trait SealingKey {
+trait SealingKey {
     fn padding_length(&self, payload_len: usize) -> usize;
     fn fill_padding(&self, padding: &mut [u8]);
     fn tag_len(&self) -> usize;
@@ -755,10 +804,10 @@ pub trait SealingKey {
         seqn: u32,
         plaintext_in_ciphertext_out: &mut [u8],
         tag_out: &mut [u8],
-    ) -> Result<(), Error>;
+    ) -> Result<(), crate::Error>;
 }
 
-pub trait OpeningKey {
+trait OpeningKey {
     fn decrypt_packet_length(&self, seqn: u32, encrypted_packet_length: &[u8]) -> u32;
     fn tag_len(&self) -> usize;
     fn open_in_place(
@@ -766,7 +815,7 @@ pub trait OpeningKey {
         seqn: u32,
         ciphertext_in_plaintext_out: &mut [u8],
         tag: &[u8],
-    ) -> Result<(), Error>;
+    ) -> Result<(), crate::Error>;
 }
 
 pub struct ClearText;
@@ -788,7 +837,7 @@ impl SealingKey for ClearText {
     fn tag_len(&self) -> usize {
         0
     }
-    fn seal_in_place(&self, _seqn: u32, _: &mut [u8], _: &mut [u8]) -> Result<(), Error> {
+    fn seal_in_place(&self, _seqn: u32, _: &mut [u8], _: &mut [u8]) -> Result<(), crate::Error> {
         Ok(())
     }
 }
@@ -803,7 +852,7 @@ impl OpeningKey for ClearText {
     fn tag_len(&self) -> usize {
         0
     }
-    fn open_in_place(&self, _: u32, _: &mut [u8], _: &[u8]) -> Result<(), Error> {
+    fn open_in_place(&self, _: u32, _: &mut [u8], _: &[u8]) -> Result<(), crate::Error> {
         Ok(())
     }
 }
@@ -838,7 +887,7 @@ impl SealingKey for aead::SealingKey {
         seqn: u32,
         plaintext_in_ciphertext_out: &mut [u8],
         tag_out: &mut [u8],
-    ) -> Result<(), Error> {
+    ) -> Result<(), crate::Error> {
         let tag_out: &mut [u8; aead::TAG_LEN] = tag_out.try_into().expect("tag_len is too short");
         self.seal_in_place(seqn, plaintext_in_ciphertext_out, tag_out);
         Ok(())
@@ -861,10 +910,10 @@ impl OpeningKey for aead::OpeningKey {
         seqn: u32,
         ciphertext_in_plaintext_out: &mut [u8],
         tag: &[u8],
-    ) -> Result<(), Error> {
+    ) -> Result<(), crate::Error> {
         let tag: &[u8; aead::TAG_LEN] = tag.try_into().expect("tag is too short");
         self.open_in_place(seqn, ciphertext_in_plaintext_out, tag)
-            .map_err(|_| Error::Ring)?;
+            .map_err(|_| crate::Error::transport("failed to open ciphertext"))?;
         Ok(())
     }
 }
@@ -916,8 +965,8 @@ fn compute_key<K>(
     secret: &[u8],
     exchange_hash: &[u8],
     session_id: &[u8],
-    make_key: fn(&[u8]) -> Result<K, Error>,
-) -> Result<K, Error> {
+    make_key: fn(&[u8]) -> Result<K, crate::Error>,
+) -> Result<K, crate::Error> {
     // described in https://tools.ietf.org/html/rfc4253#section-7.2
 
     // TODO: make secret
@@ -945,4 +994,8 @@ fn compute_key<K>(
     }
 
     make_key(&key[..expected_key_len])
+}
+
+fn eof(msg: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
+    io::Error::new(io::ErrorKind::UnexpectedEof, msg)
 }
