@@ -70,7 +70,7 @@ where
         String::from_utf8_lossy(&server_id)
     );
 
-    let mut transport = Transport {
+    Ok(Transport {
         stream,
         state: TransportState::Init,
         send: SendPacket::default(),
@@ -79,13 +79,7 @@ where
         opening_key: Box::new(ClearText),
         sealing_key: Box::new(ClearText),
         session_id: None,
-    };
-
-    tracing::trace!("Handshake");
-    futures::future::poll_fn(|cx| transport.poll_handshake(cx)).await?;
-    tracing::trace!("--> Done");
-
-    Ok(transport)
+    })
 }
 
 // ==== Transport ====
@@ -111,42 +105,6 @@ impl<T> Transport<T>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    fn poll_handshake(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
-        let span = tracing::trace_span!("Transport::poll_handshake");
-        let _enter = span.enter();
-
-        loop {
-            match self.state {
-                TransportState::Init => {
-                    tracing::trace!("--> Init");
-
-                    ready!(self
-                        .recv
-                        .poll_recv(cx, &mut self.stream, &*self.opening_key))?;
-
-                    let mut payload = self.recv.payload();
-
-                    if peek_u8(&payload) == Some(consts::SSH_MSG_KEXINIT) {
-                        self.kex.start_kex(&mut payload)?;
-                        self.state = TransportState::Kex;
-                    }
-                }
-
-                TransportState::Kex => {
-                    tracing::trace!("--> Kex");
-
-                    let session_id = ready!(self.poll_kex(cx))?;
-                    self.session_id = Some(session_id);
-                    return Poll::Ready(Ok(()));
-                }
-                TransportState::Ready => {
-                    tracing::trace!("--> Ready");
-                    return Poll::Ready(Ok(()));
-                }
-            }
-        }
-    }
-
     pub(crate) fn poll_recv(
         &mut self,
         cx: &mut task::Context<'_>,
@@ -156,28 +114,40 @@ where
 
         loop {
             match self.state {
-                TransportState::Init => panic!("transport is not initialized"),
-                TransportState::Kex => {
-                    tracing::trace!("--> Kex");
-                    let _session_id = ready!(self.poll_kex(cx))?;
-                }
-                TransportState::Ready => {
-                    tracing::trace!("--> Ready");
+                TransportState::Init | TransportState::Ready => {
+                    tracing::trace!("--> Init|Ready");
+
                     ready!(self
                         .recv
                         .poll_recv(cx, &mut self.stream, &*self.opening_key))?;
 
+                    tracing::trace!("process incoming packet");
                     let mut payload = self.recv.payload();
+                    match peek_u8(&payload) {
+                        Some(consts::SSH_MSG_KEXINIT) => {
+                            tracing::trace!("--> KEXINIT");
+                            self.kex.start_kex(&mut payload)?;
+                            self.state = TransportState::Kex;
+                        }
 
-                    if peek_u8(&payload) == Some(consts::SSH_MSG_KEXINIT) {
-                        self.kex.start_kex(&mut payload)?;
-                        self.state = TransportState::Kex;
-                        continue;
+                        Some(typ) if matches!(self.state, TransportState::Init) => {
+                            tracing::trace!("--> {}, state=TransportState::Init", typ);
+                            /* ignore packet */
+                        }
+
+                        Some(typ) => {
+                            tracing::trace!("--> {}, state=TransportState::Init", typ);
+                            payload.forget();
+                            return Poll::Ready(Ok(()));
+                        }
+
+                        None => panic!("payload is too short"),
                     }
+                }
 
-                    payload.forget();
-
-                    return Poll::Ready(Ok(()));
+                TransportState::Kex => {
+                    tracing::trace!("--> Kex");
+                    let _session_id = ready!(self.poll_kex(cx))?;
                 }
             }
         }
@@ -201,11 +171,37 @@ where
 
         loop {
             match self.state {
-                TransportState::Init => panic!("transport is not initialized"),
+                TransportState::Init => {
+                    tracing::trace!("--> Init");
+
+                    ready!(self
+                        .recv
+                        .poll_recv(cx, &mut self.stream, &*self.opening_key))?;
+
+                    tracing::trace!("process incoming packet");
+                    let mut payload = self.recv.payload();
+                    match peek_u8(&payload) {
+                        Some(consts::SSH_MSG_KEXINIT) => {
+                            tracing::trace!("--> KEXINIT");
+                            self.kex.start_kex(&mut payload)?;
+                            self.state = TransportState::Kex;
+                        }
+
+                        Some(typ) => {
+                            tracing::trace!("--> {}, state=TransportState::Init", typ);
+                            payload.forget();
+                            self.state = TransportState::Ready;
+                        }
+
+                        None => panic!("payload is too short"),
+                    }
+                }
+
                 TransportState::Kex => {
                     tracing::trace!("--> Kex");
                     ready!(self.poll_kex(cx))?;
                 }
+
                 TransportState::Ready => {
                     tracing::trace!("--> Ready");
                     ready!(self.send.poll_flush(cx, &mut self.stream))?;
