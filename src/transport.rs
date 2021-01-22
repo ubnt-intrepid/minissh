@@ -4,7 +4,10 @@
 // * https://tools.ietf.org/html/rfc4253
 // * https://tools.ietf.org/html/rfc5656
 
-use crate::consts;
+use crate::{
+    consts,
+    util::{get_ssh_string, peek_u8, put_ssh_string},
+};
 use bytes::{Buf, BufMut};
 use futures::{
     ready,
@@ -33,17 +36,13 @@ where
     let client_id = concat!("SSH-2.0-minissh_", env!("CARGO_PKG_VERSION"))
         .as_bytes()
         .to_owned();
-    stream
-        .get_mut()
-        .write_all(&client_id[..])
-        .await
-        .map_err(crate::Error::io)?;
-    stream
-        .get_mut()
-        .write_all(b"\r\n")
-        .await
-        .map_err(crate::Error::io)?;
-    stream.get_mut().flush().await.map_err(crate::Error::io)?;
+    {
+        let mut buf = Buf::chain(&client_id[..], &b"\r\n"[..]);
+        while buf.has_remaining() {
+            stream.write_buf(&mut buf).await.map_err(crate::Error::io)?;
+        }
+        stream.flush().await.map_err(crate::Error::io)?;
+    }
 
     let server_id = {
         let mut line = vec![];
@@ -694,9 +693,7 @@ impl KeyExchange {
 
                     let mut payload = recv.payload();
 
-                    let typ = payload.get_u8();
-                    if typ != consts::SSH_MSG_KEX_ECDH_REPLY {
-                        // TODO: set state
+                    if payload.get_u8() != consts::SSH_MSG_KEX_ECDH_REPLY {
                         return Poll::Ready(Err(crate::Error::transport(
                             "reply is not ECDH_REPLY",
                         )));
@@ -999,27 +996,7 @@ impl OpeningKey for aead::OpeningKey {
 
 // ==== misc ====
 
-fn peek_u8<B: Buf>(b: &B) -> Option<u8> {
-    b.chunk().get(0).copied()
-}
-
-fn get_ssh_string<B: Buf>(mut b: B) -> Vec<u8> {
-    let len = b.get_u32();
-    let mut s = vec![0u8; len as usize];
-    b.copy_to_slice(&mut s[..]);
-    s
-}
-
-fn put_ssh_string<B: BufMut>(mut b: B, s: &[u8]) {
-    let len = s.len() as u32;
-    b.put_u32(len);
-    b.put_slice(s);
-}
-
-fn digest_ssh_string<B>(digest: &mut digest::Context, mut data: B)
-where
-    B: Buf,
-{
+fn digest_ssh_string<B: Buf>(digest: &mut digest::Context, mut data: B) {
     let len = data.remaining() as u32;
     digest.update(&len.to_be_bytes());
     while data.has_remaining() {
