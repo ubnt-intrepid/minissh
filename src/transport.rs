@@ -98,6 +98,7 @@ enum TransportState {
     Init,
     Kex,
     Ready,
+    Disconnected,
 }
 
 impl<T> Transport<T>
@@ -120,9 +121,22 @@ where
                         .recv
                         .poll_recv(cx, &mut self.stream, &*self.opening_key))?;
 
-                    tracing::trace!("process incoming packet");
                     let mut payload = self.recv.payload();
+
                     match peek_u8(&payload) {
+                        Some(consts::SSH_MSG_DISCONNECT) => {
+                            // TODO: parse disconnect message
+                            self.state = TransportState::Disconnected;
+                        }
+
+                        Some(consts::SSH_MSG_IGNORE) => { /* ignore silently */ }
+                        Some(consts::SSH_MSG_DEBUG) => { /* ignore for simplicity */ }
+                        Some(consts::SSH_MSG_UNIMPLEMENTED) => {
+                            // Bypassed since it was caused by the upper layer.
+                            payload.forget();
+                            break;
+                        }
+
                         Some(consts::SSH_MSG_KEXINIT) => {
                             tracing::trace!("--> KEXINIT");
                             self.kex.start_kex(&mut payload)?;
@@ -135,7 +149,7 @@ where
                         }
 
                         Some(typ) => {
-                            tracing::trace!("--> {}, state=TransportState::Init", typ);
+                            tracing::trace!("--> {}, state=TransportState::Ready", typ);
                             payload.forget();
                             break;
                         }
@@ -147,6 +161,10 @@ where
                 TransportState::Kex => {
                     tracing::trace!("--> Kex");
                     let _session_id = ready!(self.poll_kex(cx))?;
+                }
+
+                TransportState::Disconnected => {
+                    return Poll::Ready(Err(crate::Error::transport("disconnected")));
                 }
             }
         }
@@ -175,9 +193,21 @@ where
                         .recv
                         .poll_recv(cx, &mut self.stream, &*self.opening_key))?;
 
-                    tracing::trace!("process incoming packet");
                     let mut payload = self.recv.payload();
+
                     match peek_u8(&payload) {
+                        Some(consts::SSH_MSG_DISCONNECT) => {
+                            // TODO: parse disconnect message
+                            self.state = TransportState::Disconnected;
+                        }
+
+                        Some(consts::SSH_MSG_IGNORE) => { /* ignore silently */ }
+                        Some(consts::SSH_MSG_DEBUG) => { /* ignore for simplicity */ }
+                        Some(consts::SSH_MSG_UNIMPLEMENTED) => {
+                            // Bypassed since it was caused by the upper layer.
+                            payload.forget();
+                        }
+
                         Some(consts::SSH_MSG_KEXINIT) => {
                             tracing::trace!("--> KEXINIT");
                             self.kex.start_kex(&mut payload)?;
@@ -203,6 +233,10 @@ where
                     tracing::trace!("--> Ready");
                     ready!(self.send.poll_flush(cx, &mut self.stream))?;
                     return Poll::Ready(Ok(()));
+                }
+
+                TransportState::Disconnected => {
+                    return Poll::Ready(Err(crate::Error::transport("disconnected")));
                 }
             }
         }
