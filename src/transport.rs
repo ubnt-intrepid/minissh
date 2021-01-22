@@ -120,21 +120,19 @@ where
                 TransportState::Init => {
                     tracing::trace!("--> Init");
 
-                    // Wait until server KEXINIT is received.
-                    loop {
-                        ready!(self
-                            .recv
-                            .poll_recv(cx, &mut self.stream, &*self.opening_key))?;
+                    ready!(self
+                        .recv
+                        .poll_recv(cx, &mut self.stream, &*self.opening_key))?;
 
-                        let payload = self.recv.payload();
+                    let payload = self.recv.payload();
+                    let payload = payload.as_ref();
 
-                        if !payload.is_empty() && payload[0] == consts::SSH_MSG_KEXINIT {
-                            self.kex.start_kex(payload)?;
-                            self.state = TransportState::Kex;
-                            break;
-                        }
+                    if !payload.is_empty() && payload[0] == consts::SSH_MSG_KEXINIT {
+                        self.kex.start_kex(payload)?;
+                        self.state = TransportState::Kex;
                     }
                 }
+
                 TransportState::Kex => {
                     tracing::trace!("--> Kex");
 
@@ -170,12 +168,19 @@ where
                         .recv
                         .poll_recv(cx, &mut self.stream, &*self.opening_key))?;
 
-                    let payload = self.recv.payload();
-                    if !payload.is_empty() && payload[0] == consts::SSH_MSG_KEXINIT {
-                        self.kex.start_kex(payload)?;
-                        self.state = TransportState::Kex;
-                        continue;
+                    let mut payload = self.recv.payload();
+
+                    {
+                        let payload = payload.as_ref();
+
+                        if !payload.is_empty() && payload[0] == consts::SSH_MSG_KEXINIT {
+                            self.kex.start_kex(payload)?;
+                            self.state = TransportState::Kex;
+                            continue;
+                        }
                     }
+
+                    payload.forget();
 
                     return Poll::Ready(Ok(()));
                 }
@@ -183,15 +188,13 @@ where
         }
     }
 
+    #[track_caller]
     pub(crate) fn payload(&mut self) -> Payload<'_> {
         assert!(
             matches!(self.state, TransportState::Ready),
             "packet is not ready"
         );
-        Payload {
-            recv: &mut self.recv,
-            consume_on_drop: true,
-        }
+        self.recv.payload()
     }
 
     pub(crate) fn poll_send_ready(
@@ -273,32 +276,6 @@ where
 
     pub fn session_id(&self) -> &[u8] {
         self.session_id.as_ref().unwrap().as_ref()
-    }
-}
-
-pub(crate) struct Payload<'t> {
-    recv: &'t mut RecvPacket,
-    consume_on_drop: bool,
-}
-
-impl AsRef<[u8]> for Payload<'_> {
-    fn as_ref(&self) -> &[u8] {
-        self.recv.payload()
-    }
-}
-
-impl Drop for Payload<'_> {
-    fn drop(&mut self) {
-        if self.consume_on_drop {
-            self.recv.consume();
-        }
-    }
-}
-
-impl Payload<'_> {
-    #[allow(dead_code)]
-    pub(crate) fn forget(&mut self) {
-        self.consume_on_drop = false;
     }
 }
 
@@ -538,18 +515,47 @@ impl RecvPacket {
         }
     }
 
-    fn payload(&self) -> &[u8] {
+    #[track_caller]
+    fn payload(&mut self) -> Payload<'_> {
         assert!(
             matches!(self.state, RecvPacketState::Ready),
             "cleartext is not ready to read"
         );
+        Payload {
+            recv: &mut *self,
+            consume_on_drop: true,
+        }
+    }
+
+    fn payload_raw(&self) -> &[u8] {
         let padding_length = self.buf[4];
         let payload_length = self.packet_length as usize - padding_length as usize - 1;
         &self.buf[5..5 + payload_length]
     }
+}
 
-    fn consume(&mut self) {
-        self.state = RecvPacketState::Consumed;
+pub(crate) struct Payload<'t> {
+    recv: &'t mut RecvPacket,
+    consume_on_drop: bool,
+}
+
+impl AsRef<[u8]> for Payload<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self.recv.payload_raw()
+    }
+}
+
+impl Drop for Payload<'_> {
+    fn drop(&mut self) {
+        if self.consume_on_drop {
+            self.recv.state = RecvPacketState::Consumed;
+        }
+    }
+}
+
+impl Payload<'_> {
+    pub(crate) fn forget(&mut self) {
+        self.consume_on_drop = false;
     }
 }
 
@@ -684,7 +690,8 @@ impl KeyExchange {
                     let mut digest = self.digest.take().unwrap();
                     let client_public_key = self.client_public_key();
 
-                    let mut payload = recv.payload();
+                    let payload = recv.payload();
+                    let mut payload = payload.as_ref();
 
                     let typ = payload.get_u8();
                     if typ != consts::SSH_MSG_KEX_ECDH_REPLY {
@@ -816,6 +823,8 @@ impl KeyExchange {
                     ready!(recv.poll_recv(cx, stream, opening_key))?;
 
                     let payload = recv.payload();
+                    let payload = payload.as_ref();
+
                     if payload.is_empty() || payload[0] != consts::SSH_MSG_NEWKEYS {
                         // TODO: send DISCONNECT
                         return Poll::Ready(Err(crate::Error::transport("is not NEWKEYS")));
