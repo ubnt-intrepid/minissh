@@ -22,6 +22,7 @@ const CURVE25519_SHA256: &str = "curve25519-sha256@libssh.org";
 // defined in http://cvsweb.openbsd.org/cgi-bin/cvsweb/src/usr.bin/ssh/PROTOCOL.chacha20poly1305?rev=1.5&content-type=text/x-cvsweb-markup
 const CHACHA20_POLY1305: &str = "chacha20-poly1305@openssh.com";
 
+/// Establish a SSH transport over specified I/O.
 pub async fn establish<T>(stream: T) -> Result<Transport<T>, crate::Error>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -110,7 +111,7 @@ impl<T> Transport<T>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    pub fn poll_handshake(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
+    fn poll_handshake(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
         let span = tracing::trace_span!("Transport::poll_handshake");
         let _enter = span.enter();
 
@@ -149,7 +150,10 @@ where
         }
     }
 
-    pub fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
+    pub(crate) fn poll_recv(
+        &mut self,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), crate::Error>> {
         let span = tracing::trace_span!("Transport::poll_recv");
         let _enter = span.enter();
 
@@ -179,15 +183,18 @@ where
         }
     }
 
-    pub fn payload(&self) -> &[u8] {
+    pub(crate) fn payload(&mut self) -> Payload<'_> {
         assert!(
             matches!(self.state, TransportState::Ready),
             "packet is not ready"
         );
-        self.recv.payload()
+        Payload {
+            recv: &mut self.recv,
+            consume_on_drop: true,
+        }
     }
 
-    pub fn poll_send_ready(
+    pub(crate) fn poll_send_ready(
         &mut self,
         cx: &mut task::Context<'_>,
     ) -> Poll<Result<(), crate::Error>> {
@@ -210,7 +217,7 @@ where
         }
     }
 
-    pub fn send<B>(&mut self, payload: &mut B) -> Result<(), crate::Error>
+    pub(crate) fn send<B>(&mut self, payload: &mut B) -> Result<(), crate::Error>
     where
         B: Buf,
     {
@@ -227,7 +234,10 @@ where
         Ok(())
     }
 
-    pub fn poll_flush(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
+    pub(crate) fn poll_flush(
+        &mut self,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), crate::Error>> {
         let span = tracing::trace_span!("Transport::poll_flush");
         let _enter = span.enter();
 
@@ -263,6 +273,32 @@ where
 
     pub fn session_id(&self) -> &[u8] {
         self.session_id.as_ref().unwrap().as_ref()
+    }
+}
+
+pub(crate) struct Payload<'t> {
+    recv: &'t mut RecvPacket,
+    consume_on_drop: bool,
+}
+
+impl AsRef<[u8]> for Payload<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self.recv.payload()
+    }
+}
+
+impl Drop for Payload<'_> {
+    fn drop(&mut self) {
+        if self.consume_on_drop {
+            self.recv.consume();
+        }
+    }
+}
+
+impl Payload<'_> {
+    #[allow(dead_code)]
+    pub(crate) fn forget(&mut self) {
+        self.consume_on_drop = false;
     }
 }
 
@@ -386,9 +422,17 @@ struct RecvPacket {
 }
 
 enum RecvPacketState {
+    /// a
     ReadingLength(usize),
+
+    /// a
     ReadingPacket(usize),
-    Decrypted,
+
+    /// a
+    Ready,
+
+    /// a
+    Consumed,
 }
 
 impl Default for RecvPacket {
@@ -403,7 +447,10 @@ impl Default for RecvPacket {
 }
 
 impl RecvPacket {
-    pub fn poll_recv<T>(
+    /// Attempt to receive a packet from underlying I/O, and decrypt the ciphertext.
+    ///
+    /// This method does nothing when the previous packet is not used.
+    fn poll_recv<T>(
         &mut self,
         cx: &mut task::Context<'_>,
         stream: &mut T,
@@ -418,8 +465,13 @@ impl RecvPacket {
         let mut stream = Pin::new(stream);
         loop {
             match self.state {
-                RecvPacketState::Decrypted => {
-                    tracing::trace!("--> Decrypted");
+                RecvPacketState::Ready => {
+                    tracing::trace!("--> Ready");
+                    return Poll::Ready(Ok(()));
+                }
+
+                RecvPacketState::Consumed => {
+                    tracing::trace!("--> Consumed");
                     unsafe {
                         // zeroing previous cleartext.
                         std::ptr::write_bytes(self.buf.as_mut_ptr(), 0, self.buf.len());
@@ -478,7 +530,7 @@ impl RecvPacket {
                     opening_key.open_in_place(self.seqn.0, ciphertext, tag)?;
 
                     self.seqn += num::Wrapping(1);
-                    self.state = RecvPacketState::Decrypted;
+                    self.state = RecvPacketState::Ready;
 
                     return Poll::Ready(Ok(()));
                 }
@@ -488,12 +540,16 @@ impl RecvPacket {
 
     fn payload(&self) -> &[u8] {
         assert!(
-            matches!(self.state, RecvPacketState::Decrypted),
+            matches!(self.state, RecvPacketState::Ready),
             "cleartext is not ready to read"
         );
         let padding_length = self.buf[4];
         let payload_length = self.packet_length as usize - padding_length as usize - 1;
         &self.buf[5..5 + payload_length]
+    }
+
+    fn consume(&mut self) {
+        self.state = RecvPacketState::Consumed;
     }
 }
 
