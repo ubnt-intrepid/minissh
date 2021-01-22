@@ -19,18 +19,22 @@ where
     poll_fn(|cx| transport.poll_flush(cx)).await?;
 
     tracing::trace!("wait response for ssh-userauth service request");
-    poll_fn(|cx| transport.poll_recv(cx)).await?;
-    let mut payload = transport.payload();
+    poll_fn(|cx| {
+        let mut payload = ready!(transport.poll_recv(cx))?;
 
-    let typ = payload.get_u8();
-    if typ != consts::SSH_MSG_SERVICE_ACCEPT {
-        return Err(crate::Error::userauth("incorrect reply"));
-    }
+        let typ = payload.get_u8();
+        if typ != consts::SSH_MSG_SERVICE_ACCEPT {
+            return Err(crate::Error::userauth("incorrect reply")).into();
+        }
 
-    let service_name = get_ssh_string(&mut payload);
-    if service_name != b"ssh-userauth" {
-        return Err(crate::Error::userauth("incorrect service name"));
-    }
+        let service_name = get_ssh_string(&mut payload);
+        if service_name != b"ssh-userauth" {
+            return Err(crate::Error::userauth("incorrect service name")).into();
+        }
+
+        Ok(()).into()
+    })
+    .await?;
 
     Ok(Authenticator {
         num_requested_auths: 0,
@@ -84,9 +88,7 @@ impl Authenticator {
         ready!(transport.poll_flush(cx))?;
 
         while self.num_requested_auths > 0 {
-            ready!(transport.poll_recv(cx))?;
-
-            let mut payload = transport.payload();
+            let mut payload = ready!(transport.poll_recv(cx))?;
 
             let typ = payload.get_u8();
             match typ {

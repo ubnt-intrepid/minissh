@@ -108,7 +108,7 @@ where
     pub(crate) fn poll_recv(
         &mut self,
         cx: &mut task::Context<'_>,
-    ) -> Poll<Result<(), crate::Error>> {
+    ) -> Poll<Result<Payload<'_>, crate::Error>> {
         let span = tracing::trace_span!("Transport::poll_recv");
         let _enter = span.enter();
 
@@ -138,7 +138,7 @@ where
                         Some(typ) => {
                             tracing::trace!("--> {}, state=TransportState::Init", typ);
                             payload.forget();
-                            return Poll::Ready(Ok(()));
+                            break;
                         }
 
                         None => panic!("payload is too short"),
@@ -151,15 +151,13 @@ where
                 }
             }
         }
-    }
 
-    #[track_caller]
-    pub(crate) fn payload(&mut self) -> Payload<'_> {
         assert!(
             matches!(self.state, TransportState::Ready),
             "packet is not ready"
         );
-        self.recv.payload()
+
+        Poll::Ready(Ok(self.recv.payload()))
     }
 
     pub(crate) fn poll_send_ready(
