@@ -124,11 +124,10 @@ where
                         .recv
                         .poll_recv(cx, &mut self.stream, &*self.opening_key))?;
 
-                    let payload = self.recv.payload();
-                    let payload = payload.as_ref();
+                    let mut payload = self.recv.payload();
 
-                    if !payload.is_empty() && payload[0] == consts::SSH_MSG_KEXINIT {
-                        self.kex.start_kex(payload)?;
+                    if peek_u8(&payload) == Some(consts::SSH_MSG_KEXINIT) {
+                        self.kex.start_kex(&mut payload)?;
                         self.state = TransportState::Kex;
                     }
                 }
@@ -170,14 +169,10 @@ where
 
                     let mut payload = self.recv.payload();
 
-                    {
-                        let payload = payload.as_ref();
-
-                        if !payload.is_empty() && payload[0] == consts::SSH_MSG_KEXINIT {
-                            self.kex.start_kex(payload)?;
-                            self.state = TransportState::Kex;
-                            continue;
-                        }
+                    if peek_u8(&payload) == Some(consts::SSH_MSG_KEXINIT) {
+                        self.kex.start_kex(&mut payload)?;
+                        self.state = TransportState::Kex;
+                        continue;
                     }
 
                     payload.forget();
@@ -523,6 +518,7 @@ impl RecvPacket {
         );
         Payload {
             recv: &mut *self,
+            pos: 0,
             consume_on_drop: true,
         }
     }
@@ -536,12 +532,21 @@ impl RecvPacket {
 
 pub(crate) struct Payload<'t> {
     recv: &'t mut RecvPacket,
+    pos: usize,
     consume_on_drop: bool,
 }
 
-impl AsRef<[u8]> for Payload<'_> {
-    fn as_ref(&self) -> &[u8] {
-        self.recv.payload_raw()
+impl Buf for Payload<'_> {
+    fn remaining(&self) -> usize {
+        self.recv.payload_raw().len() - self.pos
+    }
+
+    fn chunk(&self) -> &[u8] {
+        &self.recv.payload_raw()[self.pos..]
+    }
+
+    fn advance(&mut self, amt: usize) {
+        self.pos = std::cmp::min(self.pos + amt, self.recv.payload_raw().len());
     }
 }
 
@@ -596,7 +601,10 @@ impl KeyExchange {
         }
     }
 
-    fn start_kex(&mut self, server_kexinit_payload: &[u8]) -> Result<(), crate::Error> {
+    fn start_kex<B>(&mut self, server_kexinit_payload: &mut B) -> Result<(), crate::Error>
+    where
+        B: Buf,
+    {
         let span = tracing::trace_span!("start_kex");
         let _enter = span.enter();
 
@@ -690,8 +698,7 @@ impl KeyExchange {
                     let mut digest = self.digest.take().unwrap();
                     let client_public_key = self.client_public_key();
 
-                    let payload = recv.payload();
-                    let mut payload = payload.as_ref();
+                    let mut payload = recv.payload();
 
                     let typ = payload.get_u8();
                     if typ != consts::SSH_MSG_KEX_ECDH_REPLY {
@@ -733,7 +740,7 @@ impl KeyExchange {
                     };
 
                     let exchange_hash_sig = {
-                        tracing::trace!("parse exchange_hash_sig (len = {})", payload.len());
+                        tracing::trace!("parse exchange_hash_sig (len = {})", payload.remaining());
                         let raw = get_ssh_string(&mut payload);
                         let mut raw = &raw[..];
 
@@ -822,10 +829,9 @@ impl KeyExchange {
                     ready!(send.poll_flush(cx, stream))?;
                     ready!(recv.poll_recv(cx, stream, opening_key))?;
 
-                    let payload = recv.payload();
-                    let payload = payload.as_ref();
+                    let mut payload = recv.payload();
 
-                    if payload.is_empty() || payload[0] != consts::SSH_MSG_NEWKEYS {
+                    if payload.get_u8() != consts::SSH_MSG_NEWKEYS {
                         // TODO: send DISCONNECT
                         return Poll::Ready(Err(crate::Error::transport("is not NEWKEYS")));
                     }
@@ -999,10 +1005,12 @@ impl OpeningKey for aead::OpeningKey {
 
 // ==== misc ====
 
+fn peek_u8<B: Buf>(b: &B) -> Option<u8> {
+    b.chunk().get(0).copied()
+}
+
 fn get_ssh_string<B: Buf>(mut b: B) -> Vec<u8> {
     let len = b.get_u32();
-    tracing::trace!("remaining = {}", b.remaining());
-    tracing::trace!("len = {}", len);
     let mut s = vec![0u8; len as usize];
     b.copy_to_slice(&mut s[..]);
     s
@@ -1014,10 +1022,16 @@ fn put_ssh_string<B: BufMut>(mut b: B, s: &[u8]) {
     b.put_slice(s);
 }
 
-fn digest_ssh_string(digest: &mut digest::Context, s: &[u8]) {
-    let len = s.len() as u32;
+fn digest_ssh_string<B>(digest: &mut digest::Context, mut data: B)
+where
+    B: Buf,
+{
+    let len = data.remaining() as u32;
     digest.update(&len.to_be_bytes());
-    digest.update(s);
+    while data.has_remaining() {
+        digest.update(data.chunk());
+        data.advance(data.chunk().len());
+    }
 }
 
 fn digest_ssh_mpint(digest: &mut digest::Context, s: &[u8]) {

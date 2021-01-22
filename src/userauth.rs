@@ -20,8 +20,7 @@ where
 
     tracing::trace!("wait response for ssh-userauth service request");
     poll_fn(|cx| transport.poll_recv(cx)).await?;
-    let payload = transport.payload();
-    let mut payload = payload.as_ref();
+    let mut payload = transport.payload();
 
     let typ = payload.get_u8();
     if typ != consts::SSH_MSG_SERVICE_ACCEPT {
@@ -87,14 +86,13 @@ impl Authenticator {
         while self.num_requested_auths > 0 {
             ready!(transport.poll_recv(cx))?;
 
-            let payload = transport.payload();
-            let mut payload = payload.as_ref();
+            let mut payload = transport.payload();
 
             let typ = payload.get_u8();
             match typ {
                 consts::SSH_MSG_USERAUTH_SUCCESS => {
                     tracing::trace!("--> USERAUTH_SUCCESS");
-                    debug_assert!(payload.is_empty());
+                    debug_assert!(!payload.has_remaining());
 
                     return Poll::Ready(Ok(true));
                 }
