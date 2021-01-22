@@ -1,4 +1,5 @@
 use anyhow::Result;
+use futures::future::poll_fn;
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
 
@@ -16,10 +17,9 @@ async fn main() -> Result<()> {
 
     tracing::debug!("establish SSH transport");
     let mut userauth = minissh::userauth::start(&mut transport).await?;
-    userauth
-        .request_userauth_password(&mut transport, "devenv", "devenv")
+    poll_fn(|cx| userauth.poll_request_userauth_password(cx, &mut transport, "devenv", "devenv"))
         .await?;
-    let conn = userauth.authenticate(&mut transport).await?;
+    let _authenticated = poll_fn(|cx| userauth.poll_authenticate(cx, &mut transport)).await?;
 
     Ok(())
 }

@@ -1,6 +1,10 @@
-use crate::{connection::Connection, consts, transport::Transport};
+use crate::{consts, transport::Transport};
 use bytes::{Buf, BufMut};
-use futures::future::poll_fn;
+use futures::{
+    future::poll_fn,
+    ready,
+    task::{self, Poll},
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 pub async fn start<T>(transport: &mut Transport<T>) -> Result<Authenticator, crate::Error>
@@ -10,7 +14,8 @@ where
     const PAYLOAD: &[u8] = b"\x05\x00\x00\x00\x0Cssh-userauth";
 
     tracing::trace!("request ssh-userauth");
-    poll_fn(|cx| transport.poll_send(cx, &mut &PAYLOAD[..])).await?;
+    poll_fn(|cx| transport.poll_send_ready(cx)).await?;
+    transport.send(&mut &PAYLOAD[..])?;
     poll_fn(|cx| transport.poll_flush(cx)).await?;
 
     tracing::trace!("wait response for ssh-userauth service request");
@@ -38,17 +43,20 @@ pub struct Authenticator {
 
 impl Authenticator {
     /// Request a password-based authentication.
-    pub async fn request_userauth_password<T>(
+    pub fn poll_request_userauth_password<T>(
         &mut self,
+        cx: &mut task::Context<'_>,
         transport: &mut Transport<T>,
         username: &str,
         password: &str,
-    ) -> Result<(), crate::Error>
+    ) -> Poll<Result<(), crate::Error>>
     where
         T: AsyncRead + AsyncWrite + Unpin,
     {
         // ref: https://tools.ietf.org/html/rfc4252#section-8
         // FIXME: prevent password leakage.
+
+        ready!(transport.poll_send_ready(cx))?;
 
         let mut payload = vec![];
         payload.put_u8(consts::SSH_MSG_USERAUTH_REQUEST);
@@ -57,32 +65,27 @@ impl Authenticator {
         put_ssh_string(&mut payload, b"password"); // method name
         payload.put_u8(0); // FALSE
         put_ssh_string(&mut payload, password.as_ref());
-
-        poll_fn(|cx| transport.poll_send(cx, &mut &payload[..])).await?;
-
-        // Zeroing payload buffer before drop.
-        unsafe {
-            std::ptr::write_bytes(payload.as_mut_ptr(), 0u8, payload.len());
-        }
-        drop(payload);
+        transport.send(&mut &payload[..])?;
 
         self.num_requested_auths += 1;
 
-        Ok(())
+        Poll::Ready(Ok(()))
     }
 
     /// Wait for the completion of authentication process.
-    pub async fn authenticate<T>(
+    pub fn poll_authenticate<T>(
         &mut self,
+        cx: &mut task::Context<'_>,
         transport: &mut Transport<T>,
-    ) -> Result<bool, crate::Error>
+    ) -> Poll<Result<bool, crate::Error>>
     where
         T: AsyncRead + AsyncWrite + Unpin,
     {
-        poll_fn(|cx| transport.poll_flush(cx)).await?;
+        ready!(transport.poll_flush(cx))?;
 
         while self.num_requested_auths > 0 {
-            poll_fn(|cx| transport.poll_recv(cx)).await?;
+            ready!(transport.poll_recv(cx))?;
+
             let mut payload = transport.payload();
 
             let typ = payload.get_u8();
@@ -90,7 +93,8 @@ impl Authenticator {
                 consts::SSH_MSG_USERAUTH_SUCCESS => {
                     tracing::trace!("--> USERAUTH_SUCCESS");
                     debug_assert!(payload.is_empty());
-                    return Ok(true);
+
+                    return Poll::Ready(Ok(true));
                 }
 
                 consts::SSH_MSG_USERAUTH_FAILURE => {
@@ -110,12 +114,12 @@ impl Authenticator {
 
                 typ => {
                     tracing::error!("unsupported packet type: {}", typ);
-                    return Err(crate::Error::userauth("unsupported packet type"));
+                    return Poll::Ready(Err(crate::Error::userauth("unsupported packet type")));
                 }
             }
         }
 
-        Ok(false)
+        Poll::Ready(Ok(false))
     }
 }
 

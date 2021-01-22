@@ -187,14 +187,10 @@ where
         self.recv.payload()
     }
 
-    pub fn poll_send<B>(
+    pub fn poll_send_ready(
         &mut self,
         cx: &mut task::Context<'_>,
-        payload: &mut B,
-    ) -> Poll<Result<(), crate::Error>>
-    where
-        B: Buf,
-    {
+    ) -> Poll<Result<(), crate::Error>> {
         let span = tracing::trace_span!("Transport::poll_send");
         let _enter = span.enter();
 
@@ -208,16 +204,34 @@ where
                 TransportState::Ready => {
                     tracing::trace!("--> Ready");
                     ready!(self.send.poll_flush(cx, &mut self.stream))?;
-                    self.send.fill_buf(payload, &*self.sealing_key)?;
                     return Poll::Ready(Ok(()));
                 }
             }
         }
     }
 
-    pub fn poll_flush(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
-        let span = tracing::trace_span!("Transport::poll_send");
+    pub fn send<B>(&mut self, payload: &mut B) -> Result<(), crate::Error>
+    where
+        B: Buf,
+    {
+        let span = tracing::trace_span!("Transport::send");
         let _enter = span.enter();
+
+        assert!(
+            matches!(self.state, TransportState::Ready),
+            "transport is not ready to send"
+        );
+
+        self.send.fill_buf(payload, &*self.sealing_key)?;
+
+        Ok(())
+    }
+
+    pub fn poll_flush(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
+        let span = tracing::trace_span!("Transport::poll_flush");
+        let _enter = span.enter();
+
+        // a
         self.send.poll_flush(cx, &mut self.stream)
     }
 
