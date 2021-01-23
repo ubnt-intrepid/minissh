@@ -1,3 +1,8 @@
+//! Manages authentication process described in RFC4252.
+
+// Refs:
+// * https://tools.ietf.org/html/rfc4252
+
 use crate::{
     consts,
     transport::Transport,
@@ -5,53 +10,122 @@ use crate::{
 };
 use bytes::{Buf, BufMut};
 use futures::{
-    future::poll_fn,
     ready,
     task::{self, Poll},
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 
-pub async fn start<T>(transport: &mut Transport<T>) -> Result<Authenticator, crate::Error>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    const PAYLOAD: &[u8] = b"\x05\x00\x00\x00\x0Cssh-userauth";
-
-    tracing::trace!("request ssh-userauth");
-    poll_fn(|cx| transport.poll_send_ready(cx)).await?;
-    transport.send(&mut &PAYLOAD[..])?;
-    poll_fn(|cx| transport.poll_flush(cx)).await?;
-
-    tracing::trace!("wait response for ssh-userauth service request");
-    poll_fn(|cx| {
-        let mut payload = ready!(transport.poll_recv(cx))?;
-
-        let typ = payload.get_u8();
-        if typ != consts::SSH_MSG_SERVICE_ACCEPT {
-            return Err(crate::Error::userauth("incorrect reply")).into();
-        }
-
-        let service_name = get_ssh_string(&mut payload);
-        if service_name != b"ssh-userauth" {
-            return Err(crate::Error::userauth("incorrect service name")).into();
-        }
-
-        Ok(()).into()
-    })
-    .await?;
-
-    Ok(Authenticator {
-        num_requested_auths: 0,
-    })
+pub enum AuthResult {
+    Success,
+    Failure {
+        continues: Vec<u8>,
+        partial_success: u8,
+    },
 }
 
 pub struct Authenticator {
-    num_requested_auths: usize,
+    state: AuthState,
+}
+
+enum AuthState {
+    Init,
+    ServiceRequest,
+    AuthRequests,
+    Authenticated,
+}
+
+impl Default for Authenticator {
+    fn default() -> Self {
+        Self {
+            state: AuthState::Init,
+        }
+    }
 }
 
 impl Authenticator {
+    fn poll_service_request<T>(
+        &mut self,
+        cx: &mut task::Context<'_>,
+        transport: &mut Transport<T>,
+    ) -> Poll<Result<(), crate::Error>>
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
+        loop {
+            match self.state {
+                AuthState::Init => {
+                    const PAYLOAD: &[u8] = b"\x05\x00\x00\x00\x0Cssh-userauth";
+
+                    ready!(transport.poll_send_ready(cx))?;
+                    transport.send(&mut &PAYLOAD[..])?;
+
+                    ready!(transport.poll_flush(cx))?;
+
+                    self.state = AuthState::ServiceRequest;
+                }
+
+                AuthState::ServiceRequest => {
+                    let mut payload = ready!(transport.poll_recv(cx))?;
+
+                    let typ = payload.get_u8();
+                    if typ != consts::SSH_MSG_SERVICE_ACCEPT {
+                        return Err(crate::Error::userauth("incorrect reply")).into();
+                    }
+
+                    let service_name = get_ssh_string(&mut payload);
+                    if service_name != b"ssh-userauth" {
+                        return Err(crate::Error::userauth("incorrect service name")).into();
+                    }
+
+                    self.state = AuthState::AuthRequests;
+                    break;
+                }
+
+                AuthState::AuthRequests | AuthState::Authenticated => break,
+            }
+        }
+
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_send_userauth_ready<T>(
+        &mut self,
+        cx: &mut task::Context<'_>,
+        transport: &mut Transport<T>,
+    ) -> Poll<Result<(), crate::Error>>
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+    {
+        ready!(self.poll_service_request(cx, transport))?;
+        ready!(transport.poll_send_ready(cx))?;
+        Poll::Ready(Ok(()))
+    }
+
+    fn send_userauth<T, B>(
+        &mut self,
+        transport: &mut Transport<T>,
+        method_name: &str,
+        username: &str,
+        fields: &mut B,
+    ) -> Result<(), crate::Error>
+    where
+        T: AsyncRead + AsyncWrite + Unpin,
+        B: Buf,
+    {
+        let mut header = vec![];
+        header.put_u8(consts::SSH_MSG_USERAUTH_REQUEST);
+        put_ssh_string(&mut header, username.as_ref());
+        put_ssh_string(&mut header, b"ssh-connection"); // service name
+        put_ssh_string(&mut header, method_name.as_ref()); // method name
+
+        let mut payload = Buf::chain(&header[..], fields);
+        transport.send(&mut payload)?;
+
+        Ok(())
+    }
+
     /// Request a password-based authentication.
-    pub fn poll_request_userauth_password<T>(
+    pub fn poll_userauth_password<T>(
         &mut self,
         cx: &mut task::Context<'_>,
         transport: &mut Transport<T>,
@@ -61,21 +135,12 @@ impl Authenticator {
     where
         T: AsyncRead + AsyncWrite + Unpin,
     {
-        // ref: https://tools.ietf.org/html/rfc4252#section-8
-        // FIXME: prevent password leakage.
+        ready!(self.poll_send_userauth_ready(cx, transport))?;
 
-        ready!(transport.poll_send_ready(cx))?;
-
-        let mut payload = vec![];
-        payload.put_u8(consts::SSH_MSG_USERAUTH_REQUEST);
-        put_ssh_string(&mut payload, username.as_ref());
-        put_ssh_string(&mut payload, b"ssh-connection"); // service name
-        put_ssh_string(&mut payload, b"password"); // method name
-        payload.put_u8(0); // FALSE
-        put_ssh_string(&mut payload, password.as_ref());
-        transport.send(&mut &payload[..])?;
-
-        self.num_requested_auths += 1;
+        let mut fields = vec![];
+        fields.put_u8(0); // FALSE
+        put_ssh_string(&mut fields, password.as_ref());
+        self.send_userauth(transport, "password", username, &mut &fields[..])?;
 
         Poll::Ready(Ok(()))
     }
@@ -85,46 +150,59 @@ impl Authenticator {
         &mut self,
         cx: &mut task::Context<'_>,
         transport: &mut Transport<T>,
-    ) -> Poll<Result<bool, crate::Error>>
+    ) -> Poll<Result<AuthResult, crate::Error>>
     where
         T: AsyncRead + AsyncWrite + Unpin,
     {
-        ready!(transport.poll_flush(cx))?;
+        loop {
+            match self.state {
+                AuthState::Authenticated => return Poll::Ready(Ok(AuthResult::Success)),
 
-        while self.num_requested_auths > 0 {
-            let mut payload = ready!(transport.poll_recv(cx))?;
-
-            let typ = payload.get_u8();
-            match typ {
-                consts::SSH_MSG_USERAUTH_SUCCESS => {
-                    tracing::trace!("--> USERAUTH_SUCCESS");
-                    debug_assert!(!payload.has_remaining());
-
-                    return Poll::Ready(Ok(true));
+                AuthState::Init | AuthState::ServiceRequest => {
+                    ready!(self.poll_service_request(cx, transport))?;
                 }
 
-                consts::SSH_MSG_USERAUTH_FAILURE => {
-                    tracing::trace!("--> USERAUTH_FAILURE");
+                AuthState::AuthRequests => {
+                    ready!(transport.poll_flush(cx))?;
+                    let mut payload = ready!(transport.poll_recv(cx))?;
 
-                    self.num_requested_auths -= 1;
+                    let typ = payload.get_u8();
+                    match typ {
+                        consts::SSH_MSG_USERAUTH_SUCCESS => {
+                            tracing::trace!("--> USERAUTH_SUCCESS");
+                            debug_assert!(!payload.has_remaining());
+                            self.state = AuthState::Authenticated;
+                        }
 
-                    let _continues = get_ssh_string(&mut payload);
-                    let _partial_success = payload.get_u8();
-                }
+                        consts::SSH_MSG_USERAUTH_FAILURE => {
+                            tracing::trace!("--> USERAUTH_FAILURE");
 
-                consts::SSH_MSG_USERAUTH_BANNER => {
-                    tracing::trace!("--> USERAUTH_BANNER");
-                    let _message = get_ssh_string(&mut payload);
-                    let _language = get_ssh_string(&mut payload);
-                }
+                            let continues = get_ssh_string(&mut payload);
+                            let partial_success = payload.get_u8();
 
-                typ => {
-                    tracing::error!("unsupported packet type: {}", typ);
-                    return Poll::Ready(Err(crate::Error::userauth("unsupported packet type")));
+                            return Poll::Ready(Ok(AuthResult::Failure {
+                                continues,
+                                partial_success,
+                            }));
+                        }
+
+                        consts::SSH_MSG_USERAUTH_BANNER => {
+                            tracing::trace!("--> USERAUTH_BANNER");
+                            let _message = get_ssh_string(&mut payload);
+                            let _language = get_ssh_string(&mut payload);
+                            // TODO: handle banner message
+                            continue;
+                        }
+
+                        typ => {
+                            tracing::error!("unsupported packet type: {}", typ);
+                            return Poll::Ready(Err(crate::Error::userauth(
+                                "unsupported packet type",
+                            )));
+                        }
+                    }
                 }
             }
         }
-
-        Poll::Ready(Ok(false))
     }
 }

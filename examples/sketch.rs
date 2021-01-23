@@ -15,11 +15,17 @@ async fn main() -> Result<()> {
     tracing::debug!("establish SSH transport");
     let mut transport = minissh::transport::establish(stream).await?;
 
-    tracing::debug!("establish SSH transport");
-    let mut userauth = minissh::userauth::start(&mut transport).await?;
-    poll_fn(|cx| userauth.poll_request_userauth_password(cx, &mut transport, "devenv", "devenv"))
-        .await?;
-    let _authenticated = poll_fn(|cx| userauth.poll_authenticate(cx, &mut transport)).await?;
+    tracing::debug!("userauth");
+    let mut userauth = minissh::userauth::Authenticator::default();
+    poll_fn(|cx| userauth.poll_userauth_password(cx, &mut transport, "devenv", "devenv")).await?;
+    loop {
+        let res = poll_fn(|cx| userauth.poll_authenticate(cx, &mut transport)).await?;
+        match res {
+            minissh::userauth::AuthResult::Success => break,
+            minissh::userauth::AuthResult::Failure { .. } => tracing::error!("auth failed"),
+        }
+    }
+    tracing::debug!("--> success");
 
     Ok(())
 }
