@@ -8,6 +8,7 @@ enum ErrorImpl {
     Io(io::Error),
     Transport(String),
     Userauth(String),
+    Connection(String),
 }
 
 impl fmt::Display for Error {
@@ -29,5 +30,9 @@ impl Error {
 
     pub(crate) fn userauth(msg: impl Into<String>) -> Self {
         Self(ErrorImpl::Userauth(msg.into()))
+    }
+
+    pub(crate) fn connection(msg: impl Into<String>) -> Self {
+        Self(ErrorImpl::Connection(msg.into()))
     }
 }
