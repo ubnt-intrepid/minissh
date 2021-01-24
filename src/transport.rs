@@ -75,8 +75,6 @@ where
         send: SendPacket::default(),
         recv: RecvPacket::default(),
         kex: KeyExchange::new(client_id, server_id),
-        opening_key: Box::new(ClearText),
-        sealing_key: Box::new(ClearText),
         session_id: None,
     })
 }
@@ -89,8 +87,6 @@ pub struct Transport<T> {
     send: SendPacket,
     recv: RecvPacket,
     kex: KeyExchange,
-    opening_key: Box<dyn OpeningKey + Send>,
-    sealing_key: Box<dyn SealingKey + Send>,
     session_id: Option<digest::Digest>,
 }
 
@@ -117,9 +113,7 @@ where
                 TransportState::Init | TransportState::Ready => {
                     tracing::trace!("--> Init|Ready");
 
-                    ready!(self
-                        .recv
-                        .poll_recv(cx, &mut self.stream, &*self.opening_key))?;
+                    ready!(self.recv.poll_recv(cx, &mut self.stream))?;
 
                     let mut payload = self.recv.payload();
 
@@ -189,9 +183,7 @@ where
                 TransportState::Init => {
                     tracing::trace!("--> Init");
 
-                    ready!(self
-                        .recv
-                        .poll_recv(cx, &mut self.stream, &*self.opening_key))?;
+                    ready!(self.recv.poll_recv(cx, &mut self.stream))?;
 
                     let mut payload = self.recv.payload();
 
@@ -254,7 +246,7 @@ where
             "transport is not ready to send"
         );
 
-        self.send.fill_buf(payload, &*self.sealing_key)?;
+        self.send.fill_buf(payload)?;
 
         Ok(())
     }
@@ -281,13 +273,11 @@ where
             &mut self.stream,
             &mut self.send,
             &mut self.recv,
-            &*self.opening_key,
-            &*self.sealing_key,
             self.session_id.as_ref(),
         ))?;
 
-        self.opening_key = Box::new(opening_key);
-        self.sealing_key = Box::new(sealing_key);
+        self.recv.key = OpeningKey::Chacha20Poly1305(opening_key);
+        self.send.key = SealingKey::Chacha20Poly1305(sealing_key);
 
         // The first exchange hash is used as 'session id'.
         self.session_id.get_or_insert(exchange_hash);
@@ -308,6 +298,7 @@ struct SendPacket {
     buf: Vec<u8>,
     state: SendPacketState,
     seqn: num::Wrapping<u32>,
+    key: SealingKey,
 }
 
 enum SendPacketState {
@@ -322,16 +313,13 @@ impl Default for SendPacket {
             buf: vec![],
             state: SendPacketState::Available,
             seqn: num::Wrapping(0),
+            key: SealingKey::ClearText,
         }
     }
 }
 
 impl SendPacket {
-    fn fill_buf<B>(
-        &mut self,
-        payload: &mut B,
-        sealing_key: &dyn SealingKey,
-    ) -> Result<(), crate::Error>
+    fn fill_buf<B>(&mut self, payload: &mut B) -> Result<(), crate::Error>
     where
         B: Buf,
     {
@@ -340,14 +328,13 @@ impl SendPacket {
             "buffer is not empty"
         );
 
-        let padding_length = sealing_key.padding_length(payload.remaining());
+        let padding_length = self.key.padding_length(payload.remaining());
         let packet_length = 1 + payload.remaining() + padding_length;
         tracing::trace!("packet_length = {}", packet_length);
         tracing::trace!("padding_length = {}", padding_length);
 
         tracing::trace!("fill send_buffer");
-        self.buf
-            .resize(4 + packet_length + sealing_key.tag_len(), 0);
+        self.buf.resize(4 + packet_length + self.key.tag_len(), 0);
         {
             let mut buf = &mut self.buf[..4 + packet_length];
             buf.put_u32(packet_length as u32);
@@ -361,15 +348,17 @@ impl SendPacket {
                 buf = remains;
                 padding
             };
-            sealing_key.fill_padding(padding);
+            unsafe {
+                std::ptr::write_bytes(padding.as_mut_ptr(), 0, padding.len());
+            }
             debug_assert!(buf.is_empty());
         }
 
         tracing::trace!("encrypt packet");
         {
             let (packet, tag) = self.buf.split_at_mut(4 + packet_length);
-            assert_eq!(tag.len(), sealing_key.tag_len());
-            sealing_key.seal_in_place(self.seqn.0, packet, tag)?;
+            assert_eq!(tag.len(), self.key.tag_len());
+            self.key.seal_in_place(self.seqn.0, packet, tag)?;
         }
 
         self.state = SendPacketState::Writing(0);
@@ -419,19 +408,13 @@ struct RecvPacket {
     packet_length: u32,
     state: RecvPacketState,
     seqn: num::Wrapping<u32>,
+    key: OpeningKey,
 }
 
 enum RecvPacketState {
-    /// a
     ReadingLength(usize),
-
-    /// a
     ReadingPacket(usize),
-
-    /// a
     Ready,
-
-    /// a
     Consumed,
 }
 
@@ -442,6 +425,7 @@ impl Default for RecvPacket {
             packet_length: 0,
             state: RecvPacketState::ReadingLength(0),
             seqn: num::Wrapping(0),
+            key: OpeningKey::ClearText,
         }
     }
 }
@@ -454,7 +438,6 @@ impl RecvPacket {
         &mut self,
         cx: &mut task::Context<'_>,
         stream: &mut T,
-        opening_key: &dyn OpeningKey,
     ) -> Poll<Result<(), crate::Error>>
     where
         T: AsyncRead + Unpin,
@@ -503,13 +486,14 @@ impl RecvPacket {
                     }
 
                     let encrypted_packet_length = &self.buf[..4];
-                    let packet_length =
-                        opening_key.decrypt_packet_length(self.seqn.0, encrypted_packet_length);
+                    let packet_length = self
+                        .key
+                        .decrypt_packet_length(self.seqn.0, encrypted_packet_length);
                     tracing::trace!("packet_lenghth = {}", packet_length);
 
                     self.packet_length = packet_length;
                     self.buf
-                        .resize(4 + packet_length as usize + opening_key.tag_len(), 0);
+                        .resize(4 + packet_length as usize + self.key.tag_len(), 0);
                     self.state = RecvPacketState::ReadingPacket(4);
                 }
 
@@ -526,8 +510,8 @@ impl RecvPacket {
                     }
 
                     let (ciphertext, tag) = self.buf.split_at_mut(4 + self.packet_length as usize);
-                    debug_assert_eq!(tag.len(), opening_key.tag_len());
-                    opening_key.open_in_place(self.seqn.0, ciphertext, tag)?;
+                    debug_assert_eq!(tag.len(), self.key.tag_len());
+                    self.key.open_in_place(self.seqn.0, ciphertext, tag)?;
 
                     self.seqn += num::Wrapping(1);
                     self.state = RecvPacketState::Ready;
@@ -685,8 +669,6 @@ impl KeyExchange {
         stream: &mut T,
         send: &mut SendPacket,
         recv: &mut RecvPacket,
-        opening_key: &dyn OpeningKey,
-        sealing_key: &dyn SealingKey,
         session_id: Option<&digest::Digest>,
     ) -> Poll<Result<(aead::OpeningKey, aead::SealingKey, digest::Digest), crate::Error>>
     where
@@ -701,7 +683,7 @@ impl KeyExchange {
                     tracing::trace!("--> SendingClientKexInit");
 
                     ready!(send.poll_flush(cx, stream))?;
-                    send.fill_buf(&mut &self.client_kexinit_payload[..], sealing_key)?;
+                    send.fill_buf(&mut &self.client_kexinit_payload[..])?;
                     self.state = KeyExchangeState::SendingEcdhInit;
                 }
 
@@ -714,7 +696,7 @@ impl KeyExchange {
                     payload.put_u8(consts::SSH_MSG_KEX_ECDH_INIT);
                     put_ssh_string(&mut payload, self.client_public_key().as_ref());
 
-                    send.fill_buf(&mut &payload[..], sealing_key)?;
+                    send.fill_buf(&mut &payload[..])?;
 
                     self.state = KeyExchangeState::ReceivingEcdhReply;
                 }
@@ -723,7 +705,7 @@ impl KeyExchange {
                     tracing::trace!("--> ReceivingEcdhReply");
 
                     ready!(send.poll_flush(cx, stream))?;
-                    ready!(recv.poll_recv(cx, stream, opening_key))?;
+                    ready!(recv.poll_recv(cx, stream))?;
 
                     let mut digest = self.digest.take().unwrap();
                     let client_public_key = self.client_public_key();
@@ -849,7 +831,7 @@ impl KeyExchange {
 
                     let mut payload = vec![];
                     payload.put_u8(consts::SSH_MSG_NEWKEYS);
-                    send.fill_buf(&mut &payload[..], sealing_key)?;
+                    send.fill_buf(&mut &payload[..])?;
 
                     self.state = KeyExchangeState::ReceivingServerNewKeys;
                 }
@@ -858,7 +840,7 @@ impl KeyExchange {
                     tracing::trace!("--> ReceivingServerNewKeys");
 
                     ready!(send.poll_flush(cx, stream))?;
-                    ready!(recv.poll_recv(cx, stream, opening_key))?;
+                    ready!(recv.poll_recv(cx, stream))?;
 
                     let mut payload = recv.payload();
 
@@ -910,125 +892,110 @@ fn client_kex_payload(rng: &rand::SystemRandom) -> Result<Vec<u8>, crate::Error>
 
 // ==== ciphers ====
 
-trait SealingKey {
-    fn padding_length(&self, payload_len: usize) -> usize;
-    fn fill_padding(&self, padding: &mut [u8]);
-    fn tag_len(&self) -> usize;
-    fn seal_in_place(
-        &self,
-        seqn: u32,
-        plaintext_in_ciphertext_out: &mut [u8],
-        tag_out: &mut [u8],
-    ) -> Result<(), crate::Error>;
+enum OpeningKey {
+    ClearText,
+    Chacha20Poly1305(aead::OpeningKey),
 }
-
-trait OpeningKey {
-    fn decrypt_packet_length(&self, seqn: u32, encrypted_packet_length: &[u8]) -> u32;
-    fn tag_len(&self) -> usize;
-    fn open_in_place(
-        &self,
-        seqn: u32,
-        ciphertext_in_plaintext_out: &mut [u8],
-        tag: &[u8],
-    ) -> Result<(), crate::Error>;
-}
-
-pub struct ClearText;
-impl SealingKey for ClearText {
-    fn padding_length(&self, payload_len: usize) -> usize {
-        const BLOCK_SIZE: usize = 8;
-        let padding_length = BLOCK_SIZE - ((5 + payload_len) % BLOCK_SIZE);
-        if padding_length < 4 {
-            padding_length + BLOCK_SIZE
-        } else {
-            padding_length
-        }
-    }
-    fn fill_padding(&self, padding: &mut [u8]) {
-        unsafe {
-            std::ptr::write_bytes(padding.as_mut_ptr(), 0, padding.len());
-        }
-    }
-    fn tag_len(&self) -> usize {
-        0
-    }
-    fn seal_in_place(&self, _seqn: u32, _: &mut [u8], _: &mut [u8]) -> Result<(), crate::Error> {
-        Ok(())
-    }
-}
-impl OpeningKey for ClearText {
-    fn decrypt_packet_length(&self, _: u32, encrypted_packet_length: &[u8]) -> u32 {
-        u32::from_be_bytes(
-            encrypted_packet_length
-                .try_into()
-                .expect("encrypted_packet_length is too short"),
-        )
-    }
-    fn tag_len(&self) -> usize {
-        0
-    }
-    fn open_in_place(&self, _: u32, _: &mut [u8], _: &[u8]) -> Result<(), crate::Error> {
-        Ok(())
-    }
-}
-
-impl SealingKey for aead::SealingKey {
-    fn padding_length(&self, payload_len: usize) -> usize {
-        const BLOCK_SIZE: usize = 8;
-        const MINIMUM_PACKET_LEN: usize = 16;
-
-        let padding_len = if 5 + payload_len <= MINIMUM_PACKET_LEN {
-            MINIMUM_PACKET_LEN - payload_len - 1
-        } else {
-            BLOCK_SIZE - ((1 + payload_len) % BLOCK_SIZE)
-        };
-
-        if padding_len < aead::PACKET_LENGTH_LEN {
-            padding_len + BLOCK_SIZE
-        } else {
-            padding_len
-        }
-    }
-    fn fill_padding(&self, padding: &mut [u8]) {
-        unsafe {
-            std::ptr::write_bytes(padding.as_mut_ptr(), 0u8, padding.len());
-        }
-    }
-    fn tag_len(&self) -> usize {
-        aead::TAG_LEN
-    }
-    fn seal_in_place(
-        &self,
-        seqn: u32,
-        plaintext_in_ciphertext_out: &mut [u8],
-        tag_out: &mut [u8],
-    ) -> Result<(), crate::Error> {
-        let tag_out: &mut [u8; aead::TAG_LEN] = tag_out.try_into().expect("tag_len is too short");
-        self.seal_in_place(seqn, plaintext_in_ciphertext_out, tag_out);
-        Ok(())
-    }
-}
-
-impl OpeningKey for aead::OpeningKey {
+impl OpeningKey {
+    #[inline]
     fn decrypt_packet_length(&self, seqn: u32, encrypted_packet_length: &[u8]) -> u32 {
-        let encrypted_packet_length: [u8; aead::PACKET_LENGTH_LEN] = encrypted_packet_length
-            .try_into()
-            .expect("packet length is too short");
-        let decrypted = self.decrypt_packet_length(seqn, encrypted_packet_length);
-        u32::from_be_bytes(decrypted)
+        match self {
+            OpeningKey::ClearText => u32::from_be_bytes(
+                encrypted_packet_length
+                    .try_into()
+                    .expect("encrypted_packet_length is too short"),
+            ),
+            OpeningKey::Chacha20Poly1305(ref key) => {
+                let encrypted_packet_length: [u8; aead::PACKET_LENGTH_LEN] =
+                    encrypted_packet_length
+                        .try_into()
+                        .expect("packet length is too short");
+                let decrypted = key.decrypt_packet_length(seqn, encrypted_packet_length);
+                u32::from_be_bytes(decrypted)
+            }
+        }
     }
+
+    #[inline]
     fn tag_len(&self) -> usize {
-        aead::TAG_LEN
+        match self {
+            OpeningKey::ClearText => 0,
+            OpeningKey::Chacha20Poly1305(..) => aead::TAG_LEN,
+        }
     }
+
+    #[inline]
     fn open_in_place(
         &self,
         seqn: u32,
         ciphertext_in_plaintext_out: &mut [u8],
         tag: &[u8],
     ) -> Result<(), crate::Error> {
-        let tag: &[u8; aead::TAG_LEN] = tag.try_into().expect("tag is too short");
-        self.open_in_place(seqn, ciphertext_in_plaintext_out, tag)
-            .map_err(|_| crate::Error::transport("failed to open ciphertext"))?;
+        if let OpeningKey::Chacha20Poly1305(key) = self {
+            let tag: &[u8; aead::TAG_LEN] = tag.try_into().expect("tag is too short");
+            key.open_in_place(seqn, ciphertext_in_plaintext_out, tag)
+                .map_err(|_| crate::Error::transport("failed to open ciphertext"))?;
+        }
+        Ok(())
+    }
+}
+
+enum SealingKey {
+    ClearText,
+    Chacha20Poly1305(aead::SealingKey),
+}
+impl SealingKey {
+    #[inline]
+    fn padding_length(&self, payload_len: usize) -> usize {
+        match self {
+            SealingKey::ClearText => {
+                const BLOCK_SIZE: usize = 8;
+                let padding_length = BLOCK_SIZE - ((5 + payload_len) % BLOCK_SIZE);
+                if padding_length < 4 {
+                    padding_length + BLOCK_SIZE
+                } else {
+                    padding_length
+                }
+            }
+            SealingKey::Chacha20Poly1305(..) => {
+                const BLOCK_SIZE: usize = 8;
+                const MINIMUM_PACKET_LEN: usize = 16;
+
+                let padding_len = if 5 + payload_len <= MINIMUM_PACKET_LEN {
+                    MINIMUM_PACKET_LEN - payload_len - 1
+                } else {
+                    BLOCK_SIZE - ((1 + payload_len) % BLOCK_SIZE)
+                };
+
+                if padding_len < aead::PACKET_LENGTH_LEN {
+                    padding_len + BLOCK_SIZE
+                } else {
+                    padding_len
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn tag_len(&self) -> usize {
+        match self {
+            SealingKey::ClearText => 0,
+            SealingKey::Chacha20Poly1305(..) => aead::TAG_LEN,
+        }
+    }
+
+    #[inline]
+    fn seal_in_place(
+        &self,
+        seqn: u32,
+        plaintext_in_ciphertext_out: &mut [u8],
+        tag_out: &mut [u8],
+    ) -> Result<(), crate::Error> {
+        if let SealingKey::Chacha20Poly1305(key) = self {
+            let tag_out: &mut [u8; aead::TAG_LEN] =
+                tag_out.try_into().expect("tag_len is too short");
+            key.seal_in_place(seqn, plaintext_in_ciphertext_out, tag_out);
+        }
         Ok(())
     }
 }
