@@ -8,7 +8,7 @@ use crate::{
     consts,
     util::{get_ssh_string, peek_u8, put_ssh_string},
 };
-use bytes::{Buf, BufMut};
+use bytes::{buf::UninitSlice, Buf, BufMut};
 use futures::{
     ready,
     task::{self, Poll},
@@ -803,28 +803,30 @@ impl KeyExchange {
                                     })?;
 
                                 tracing::trace!("calculate encryption keys");
-                                let sealing_key = compute_key(
-                                    64,
-                                    b'C',
-                                    secret,
-                                    exchange_hash.as_ref(),
-                                    exchange_hash.as_ref(), // equivalent to session_id,
-                                    |key| {
-                                        let key: &[u8; aead::KEY_LEN] = key.try_into().unwrap();
-                                        Ok(aead::SealingKey::new(key))
-                                    },
-                                )?;
-                                let opening_key = compute_key(
-                                    64,
-                                    b'D',
-                                    secret,
-                                    exchange_hash.as_ref(),
-                                    exchange_hash.as_ref(), // equivalent to session_id,
-                                    |key| {
-                                        let key: &[u8; aead::KEY_LEN] = key.try_into().unwrap();
-                                        Ok(aead::OpeningKey::new(key))
-                                    },
-                                )?;
+                                let sealing_key = {
+                                    let mut key = [0u8; aead::KEY_LEN];
+                                    let mut key_buf = KeyBuf::new(&mut key[..]);
+                                    compute_key(
+                                        &mut key_buf,
+                                        b'C',
+                                        secret,
+                                        exchange_hash.as_ref(),
+                                        exchange_hash.as_ref(), // equivalent to session_id,
+                                    )?;
+                                    aead::SealingKey::new(&key)
+                                };
+                                let opening_key = {
+                                    let mut key = [0u8; aead::KEY_LEN];
+                                    let mut key_buf = KeyBuf::new(&mut key[..]);
+                                    compute_key(
+                                        &mut key_buf,
+                                        b'D',
+                                        secret,
+                                        exchange_hash.as_ref(),
+                                        exchange_hash.as_ref(), // equivalent to session_id,
+                                    )?;
+                                    aead::OpeningKey::new(&key)
+                                };
 
                                 *slot_out = Some((opening_key, sealing_key, exchange_hash));
 
@@ -1057,18 +1059,53 @@ fn digest_ssh_mpint(digest: &mut digest::Context, s: &[u8]) {
     digest.update(&s[i..]);
 }
 
-fn compute_key<K>(
-    expected_key_len: usize,
+// ==== compute_key ====
+
+struct KeyBuf<'a> {
+    data: &'a mut [u8],
+    filled: usize,
+}
+impl<'a> KeyBuf<'a> {
+    #[inline]
+    fn new(data: &'a mut [u8]) -> Self {
+        Self { data, filled: 0 }
+    }
+
+    #[inline]
+    fn filled(&self) -> &[u8] {
+        &self.data[..self.filled]
+    }
+}
+unsafe impl BufMut for KeyBuf<'_> {
+    #[inline]
+    fn remaining_mut(&self) -> usize {
+        self.data.len() - self.filled
+    }
+    #[inline]
+    fn chunk_mut(&mut self) -> &mut UninitSlice {
+        let remaining = &mut self.data[self.filled..];
+        unsafe { UninitSlice::from_raw_parts_mut(remaining.as_mut_ptr(), remaining.len()) }
+    }
+
+    #[inline]
+    unsafe fn advance_mut(&mut self, cnt: usize) {
+        self.filled += cnt;
+    }
+}
+
+fn compute_key(
+    key_buf: &mut KeyBuf<'_>,
     c: u8,
     secret: &[u8],
     exchange_hash: &[u8],
     session_id: &[u8],
-    make_key: fn(&[u8]) -> Result<K, crate::Error>,
-) -> Result<K, crate::Error> {
+) -> Result<(), crate::Error> {
     // described in https://tools.ietf.org/html/rfc4253#section-7.2
 
-    // TODO: make secret
-    let mut key = vec![];
+    assert!(
+        key_buf.remaining_mut() % digest::SHA256.output_len == 0,
+        "incorrect key_buf size"
+    );
 
     let digest = {
         let mut h = digest::Context::new(&digest::SHA256);
@@ -1078,20 +1115,20 @@ fn compute_key<K>(
         h.update(session_id);
         h.finish()
     }; // K1
-    key.put_slice(digest.as_ref());
+    key_buf.put_slice(digest.as_ref());
 
-    while key.len() < expected_key_len {
+    while key_buf.has_remaining_mut() {
         let digest = {
             let mut h = digest::Context::new(&digest::SHA256);
             digest_ssh_mpint(&mut h, secret);
             h.update(exchange_hash);
-            h.update(&key[..]);
+            h.update(key_buf.filled());
             h.finish()
         }; // K2, K3, ...
-        key.put_slice(digest.as_ref());
+        key_buf.put_slice(digest.as_ref());
     }
 
-    make_key(&key[..expected_key_len])
+    Ok(())
 }
 
 fn eof(msg: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
