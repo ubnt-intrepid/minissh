@@ -139,7 +139,7 @@ where
 
                         Some(consts::SSH_MSG_KEXINIT) => {
                             tracing::trace!("--> KEXINIT");
-                            self.kex.start_kex(&mut payload)?;
+                            self.kex.start(&mut payload)?;
                             self.state = TransportState::Kex;
                         }
 
@@ -160,7 +160,7 @@ where
 
                 TransportState::Kex => {
                     tracing::trace!("--> Kex");
-                    let _session_id = ready!(self.poll_kex(cx))?;
+                    ready!(self.poll_kex(cx))?;
                 }
 
                 TransportState::Disconnected => {
@@ -210,7 +210,7 @@ where
 
                         Some(consts::SSH_MSG_KEXINIT) => {
                             tracing::trace!("--> KEXINIT");
-                            self.kex.start_kex(&mut payload)?;
+                            self.kex.start(&mut payload)?;
                             self.state = TransportState::Kex;
                         }
 
@@ -270,30 +270,31 @@ where
         self.send.poll_flush(cx, &mut self.stream)
     }
 
-    fn poll_kex(
-        &mut self,
-        cx: &mut task::Context<'_>,
-    ) -> Poll<Result<digest::Digest, crate::Error>> {
+    fn poll_kex(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
         assert!(
             matches!(self.state, TransportState::Kex),
             "unexpected condition"
         );
 
-        let (opening_key, sealing_key, exchange_hash) = ready!(self.kex.poll_complete_kex(
+        let (opening_key, sealing_key, exchange_hash) = ready!(self.kex.poll_complete(
             cx,
             &mut self.stream,
             &mut self.send,
             &mut self.recv,
             &*self.opening_key,
             &*self.sealing_key,
+            self.session_id.as_ref(),
         ))?;
 
         self.opening_key = Box::new(opening_key);
         self.sealing_key = Box::new(sealing_key);
 
+        // The first exchange hash is used as 'session id'.
+        self.session_id.get_or_insert(exchange_hash);
+
         self.state = TransportState::Ready;
 
-        Poll::Ready(Ok(exchange_hash))
+        Poll::Ready(Ok(()))
     }
 
     pub fn session_id(&self) -> &[u8] {
@@ -600,7 +601,7 @@ struct KeyExchange {
     client_ephemeral_key: Option<(agreement::EphemeralPrivateKey, agreement::PublicKey)>,
     digest: Option<digest::Context>,
     state: KeyExchangeState,
-    out: Option<(aead::OpeningKey, aead::SealingKey, digest::Digest)>,
+    output: Option<(aead::OpeningKey, aead::SealingKey, digest::Digest)>,
     rng: rand::SystemRandom,
 }
 
@@ -623,12 +624,12 @@ impl KeyExchange {
             client_ephemeral_key: None,
             digest: None,
             state: KeyExchangeState::Init,
-            out: None,
+            output: None,
             rng: rand::SystemRandom::new(),
         }
     }
 
-    fn start_kex<B>(&mut self, server_kexinit_payload: &mut B) -> Result<(), crate::Error>
+    fn start<B>(&mut self, server_kexinit_payload: &mut B) -> Result<(), crate::Error>
     where
         B: Buf,
     {
@@ -677,7 +678,8 @@ impl KeyExchange {
             .1
     }
 
-    fn poll_complete_kex<T>(
+    #[allow(clippy::clippy::too_many_arguments)]
+    fn poll_complete<T>(
         &mut self,
         cx: &mut task::Context<'_>,
         stream: &mut T,
@@ -685,6 +687,7 @@ impl KeyExchange {
         recv: &mut RecvPacket,
         opening_key: &dyn OpeningKey,
         sealing_key: &dyn SealingKey,
+        session_id: Option<&digest::Digest>,
     ) -> Poll<Result<(aead::OpeningKey, aead::SealingKey, digest::Digest), crate::Error>>
     where
         T: AsyncRead + AsyncWrite + Unpin,
@@ -789,7 +792,7 @@ impl KeyExchange {
                         &server_public_key,
                         crate::Error::transport("errored during key agreement"),
                         {
-                            let slot_out = &mut self.out;
+                            let slot_out = &mut self.output;
                             move |secret| {
                                 tracing::trace!("calculate exchange hash H");
                                 let exchange_hash = {
@@ -803,6 +806,7 @@ impl KeyExchange {
                                     })?;
 
                                 tracing::trace!("calculate encryption keys");
+                                let session_id = session_id.unwrap_or(&exchange_hash);
                                 let sealing_key = {
                                     let mut key = [0u8; aead::KEY_LEN];
                                     let mut key_buf = KeyBuf::new(&mut key[..]);
@@ -810,8 +814,8 @@ impl KeyExchange {
                                         &mut key_buf,
                                         b'C',
                                         secret,
-                                        exchange_hash.as_ref(),
-                                        exchange_hash.as_ref(), // equivalent to session_id,
+                                        &exchange_hash,
+                                        session_id,
                                     )?;
                                     aead::SealingKey::new(&key)
                                 };
@@ -822,8 +826,8 @@ impl KeyExchange {
                                         &mut key_buf,
                                         b'D',
                                         secret,
-                                        exchange_hash.as_ref(),
-                                        exchange_hash.as_ref(), // equivalent to session_id,
+                                        &exchange_hash,
+                                        session_id,
                                     )?;
                                     aead::OpeningKey::new(&key)
                                 };
@@ -865,8 +869,7 @@ impl KeyExchange {
 
                     self.state = KeyExchangeState::Exchanged;
 
-                    let out = self.out.take().unwrap();
-                    return Poll::Ready(Ok(out));
+                    return Poll::Ready(Ok(self.output.take().unwrap()));
                 }
 
                 KeyExchangeState::Init | KeyExchangeState::Exchanged => panic!("unexpected state"),
@@ -1097,8 +1100,8 @@ fn compute_key(
     key_buf: &mut KeyBuf<'_>,
     c: u8,
     secret: &[u8],
-    exchange_hash: &[u8],
-    session_id: &[u8],
+    exchange_hash: &digest::Digest,
+    session_id: &digest::Digest,
 ) -> Result<(), crate::Error> {
     // described in https://tools.ietf.org/html/rfc4253#section-7.2
 
@@ -1110,9 +1113,9 @@ fn compute_key(
     let digest = {
         let mut h = digest::Context::new(&digest::SHA256);
         digest_ssh_mpint(&mut h, secret);
-        h.update(exchange_hash);
+        h.update(exchange_hash.as_ref());
         h.update(&[c]);
-        h.update(session_id);
+        h.update(session_id.as_ref());
         h.finish()
     }; // K1
     key_buf.put_slice(digest.as_ref());
@@ -1121,7 +1124,7 @@ fn compute_key(
         let digest = {
             let mut h = digest::Context::new(&digest::SHA256);
             digest_ssh_mpint(&mut h, secret);
-            h.update(exchange_hash);
+            h.update(exchange_hash.as_ref());
             h.update(key_buf.filled());
             h.finish()
         }; // K2, K3, ...
