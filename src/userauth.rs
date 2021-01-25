@@ -57,7 +57,7 @@ impl Authenticator {
                     const PAYLOAD: &[u8] = b"\x05\x00\x00\x00\x0Cssh-userauth";
 
                     ready!(transport.poll_send_ready(cx))?;
-                    transport.send(&mut &PAYLOAD[..])?;
+                    transport.fill_buf(&mut &PAYLOAD[..])?;
 
                     ready!(transport.poll_flush(cx))?;
 
@@ -119,7 +119,7 @@ impl Authenticator {
         put_ssh_string(&mut header, method_name.as_ref()); // method name
 
         let mut payload = Buf::chain(&header[..], fields);
-        transport.send(&mut payload)?;
+        transport.fill_buf(&mut payload)?;
 
         Ok(())
     }

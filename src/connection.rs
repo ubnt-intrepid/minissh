@@ -58,7 +58,7 @@ impl Connection {
         payload.put_u32(self.initial_window_size);
         payload.put_u32(self.maximum_packet_size);
 
-        transport.send(&mut &payload[..])?;
+        transport.fill_buf(&mut &payload[..])?;
 
         Poll::Ready(Ok(sender_channel))
     }
@@ -111,7 +111,7 @@ impl Connection {
         payload.put_u8(0); // want_reply=FALSE
         put_ssh_string(&mut payload, command.as_ref());
 
-        transport.send(&mut &payload[..])?;
+        transport.fill_buf(&mut &payload[..])?;
 
         // TODO: mark send state.
 
@@ -138,7 +138,7 @@ impl Connection {
         payload.put_u8(consts::SSH_MSG_CHANNEL_CLOSE);
         payload.put_u32(channel.recipient_id.0);
 
-        transport.send(&mut &payload[..])?;
+        transport.fill_buf(&mut &payload[..])?;
 
         channel.state = ChannelState::Closing;
 
@@ -167,7 +167,7 @@ impl Connection {
         payload.put_u32(channel.recipient_id.0);
         payload.put_u32(additional);
 
-        transport.send(&mut &payload[..])?;
+        transport.fill_buf(&mut &payload[..])?;
 
         channel.recipient_window_size = channel.recipient_window_size.saturating_add(additional);
 
