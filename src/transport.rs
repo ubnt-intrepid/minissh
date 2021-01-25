@@ -15,9 +15,7 @@ use futures::{
 };
 use ring::{aead::chacha20_poly1305_openssh as aead, agreement, digest, rand, signature};
 use std::{convert::TryInto as _, io, num, ops::Range, pin::Pin};
-use tokio::io::{
-    AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader, ReadBuf,
-};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 
 // defined in https://git.libssh.org/projects/libssh.git/tree/doc/curve25519-sha256@libssh.org.txt#n62
 const CURVE25519_SHA256: &str = "curve25519-sha256@libssh.org";
@@ -26,12 +24,10 @@ const CURVE25519_SHA256: &str = "curve25519-sha256@libssh.org";
 const CHACHA20_POLY1305: &str = "chacha20-poly1305@openssh.com";
 
 /// Establish a SSH transport over specified I/O.
-pub async fn establish<T>(stream: T) -> Result<Transport<T>, crate::Error>
+pub async fn establish<T>(stream: &mut T) -> Result<Transport, crate::Error>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncBufRead + AsyncWrite + Unpin,
 {
-    let mut stream = BufReader::new(stream);
-
     tracing::debug!("Exchange SSH identifiers");
     let client_id = concat!("SSH-2.0-minissh_", env!("CARGO_PKG_VERSION"))
         .as_bytes()
@@ -70,7 +66,6 @@ where
     );
 
     Ok(Transport {
-        stream,
         state: TransportState::Init(vec![]),
         send: SendPacket::default(),
         recv: RecvPacket::default(),
@@ -82,8 +77,7 @@ where
 
 // ==== Transport ====
 
-pub struct Transport<T> {
-    stream: BufReader<T>,
+pub struct Transport {
     state: TransportState,
     send: SendPacket,
     recv: RecvPacket,
@@ -99,11 +93,15 @@ enum TransportState {
     Disconnected,
 }
 
-impl<T> Transport<T>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    pub fn poll_handshake(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
+impl Transport {
+    pub fn poll_handshake<T>(
+        &mut self,
+        cx: &mut task::Context<'_>,
+        stream: &mut T,
+    ) -> Poll<Result<(), crate::Error>>
+    where
+        T: AsyncBufRead + AsyncWrite + Unpin,
+    {
         let span = tracing::trace_span!("Transport::poll_handshake");
         let _enter = span.enter();
 
@@ -112,7 +110,7 @@ where
                 TransportState::Init(ref mut recv_buf) => {
                     tracing::trace!("--> Init");
 
-                    let range = ready!(self.recv.poll_recv(cx, &mut self.stream, recv_buf))?;
+                    let range = ready!(self.recv.poll_recv(cx, stream, recv_buf))?;
 
                     let mut payload = &recv_buf[range];
 
@@ -138,7 +136,7 @@ where
 
                 TransportState::Kex => {
                     tracing::trace!("--> Kex");
-                    ready!(self.poll_kex(cx))?;
+                    ready!(self.poll_kex(cx, stream))?;
                 }
 
                 TransportState::Ready => return Poll::Ready(Ok(())),
@@ -151,20 +149,28 @@ where
     }
 
     #[inline]
-    pub(crate) fn poll_recv<'a>(
+    pub fn poll_recv<'a, T>(
         &mut self,
         cx: &mut task::Context<'_>,
+        stream: &mut T,
         recv_buf: &'a mut Vec<u8>,
-    ) -> Poll<Result<&'a [u8], crate::Error>> {
-        self.poll_recv_inner(cx, recv_buf)
+    ) -> Poll<Result<&'a [u8], crate::Error>>
+    where
+        T: AsyncBufRead + AsyncWrite + Unpin,
+    {
+        self.poll_recv_inner(cx, stream, recv_buf)
             .map_ok(move |range| &recv_buf[range])
     }
 
-    fn poll_recv_inner(
+    fn poll_recv_inner<T>(
         &mut self,
         cx: &mut task::Context<'_>,
+        stream: &mut T,
         recv_buf: &mut Vec<u8>,
-    ) -> Poll<Result<Range<usize>, crate::Error>> {
+    ) -> Poll<Result<Range<usize>, crate::Error>>
+    where
+        T: AsyncBufRead + AsyncWrite + Unpin,
+    {
         let span = tracing::trace_span!("Transport::poll_recv");
         let _enter = span.enter();
 
@@ -175,7 +181,7 @@ where
                 TransportState::Ready => {
                     tracing::trace!("--> Ready");
 
-                    let range = ready!(self.recv.poll_recv(cx, &mut self.stream, recv_buf))?;
+                    let range = ready!(self.recv.poll_recv(cx, stream, recv_buf))?;
                     let mut payload = &recv_buf[range.clone()];
 
                     match peek_u8(&payload) {
@@ -208,7 +214,7 @@ where
 
                 TransportState::Kex => {
                     tracing::trace!("--> Kex");
-                    ready!(self.poll_kex(cx))?;
+                    ready!(self.poll_kex(cx, stream))?;
                 }
 
                 TransportState::Disconnected => {
@@ -218,10 +224,14 @@ where
         }
     }
 
-    pub(crate) fn poll_send_ready(
+    pub fn poll_send_ready<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-    ) -> Poll<Result<(), crate::Error>> {
+        stream: &mut T,
+    ) -> Poll<Result<(), crate::Error>>
+    where
+        T: AsyncBufRead + AsyncWrite + Unpin,
+    {
         let span = tracing::trace_span!("Transport::poll_send");
         let _enter = span.enter();
 
@@ -231,12 +241,12 @@ where
 
                 TransportState::Kex => {
                     tracing::trace!("--> Kex");
-                    ready!(self.poll_kex(cx))?;
+                    ready!(self.poll_kex(cx, stream))?;
                 }
 
                 TransportState::Ready => {
                     tracing::trace!("--> Ready");
-                    ready!(self.send.poll_flush(cx, &mut self.stream))?;
+                    ready!(self.send.poll_flush(cx, stream))?;
                     return Poll::Ready(Ok(()));
                 }
 
@@ -247,7 +257,7 @@ where
         }
     }
 
-    pub(crate) fn fill<F>(&mut self, payload_length: usize, filler: F) -> Result<(), crate::Error>
+    pub fn fill<F>(&mut self, payload_length: usize, filler: F) -> Result<(), crate::Error>
     where
         F: FnOnce(&mut [u8]),
     {
@@ -265,24 +275,35 @@ where
     }
 
     #[inline]
-    pub(crate) fn fill_buf<B>(&mut self, payload: &mut B) -> Result<(), crate::Error>
+    pub fn fill_buf<B>(&mut self, payload: &mut B) -> Result<(), crate::Error>
     where
         B: Buf,
     {
         self.fill(payload.remaining(), |buf| payload.copy_to_slice(buf))
     }
 
-    pub(crate) fn poll_flush(
+    pub fn poll_flush<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-    ) -> Poll<Result<(), crate::Error>> {
+        stream: &mut T,
+    ) -> Poll<Result<(), crate::Error>>
+    where
+        T: AsyncWrite + Unpin,
+    {
         let span = tracing::trace_span!("Transport::poll_flush");
         let _enter = span.enter();
 
-        self.send.poll_flush(cx, &mut self.stream)
+        self.send.poll_flush(cx, stream)
     }
 
-    fn poll_kex(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
+    fn poll_kex<T>(
+        &mut self,
+        cx: &mut task::Context<'_>,
+        stream: &mut T,
+    ) -> Poll<Result<(), crate::Error>>
+    where
+        T: AsyncBufRead + AsyncWrite + Unpin,
+    {
         assert!(
             matches!(self.state, TransportState::Kex),
             "unexpected condition"
@@ -290,7 +311,7 @@ where
 
         let (opening_key, sealing_key, exchange_hash) = ready!(self.kex.poll_complete(
             cx,
-            &mut self.stream,
+            stream,
             &mut self.send,
             &mut self.recv,
             self.session_id.as_ref(),
@@ -307,8 +328,8 @@ where
         Poll::Ready(Ok(()))
     }
 
-    pub fn session_id(&self) -> &[u8] {
-        self.session_id.as_ref().unwrap().as_ref()
+    pub(crate) fn session_id(&self) -> &digest::Digest {
+        self.session_id.as_ref().unwrap()
     }
 }
 
@@ -459,7 +480,7 @@ impl RecvPacket {
         buf: &mut Vec<u8>,
     ) -> Poll<Result<Range<usize>, crate::Error>>
     where
-        T: AsyncRead + Unpin,
+        T: AsyncBufRead + Unpin,
     {
         let span = tracing::trace_span!("RecvPacket::poll_recv");
         let _enter = span.enter();
@@ -637,7 +658,7 @@ impl KeyExchange {
         session_id: Option<&digest::Digest>,
     ) -> Poll<Result<(aead::OpeningKey, aead::SealingKey, digest::Digest), crate::Error>>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        T: AsyncBufRead + AsyncWrite + Unpin,
     {
         let span = tracing::trace_span!("KeyExchange::poll_complete_kex");
         let _enter = span.enter();

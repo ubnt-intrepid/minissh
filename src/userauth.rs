@@ -13,7 +13,7 @@ use futures::{
     ready,
     task::{self, Poll},
 };
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncBufRead, AsyncWrite};
 
 pub enum AuthResult {
     Success,
@@ -48,26 +48,27 @@ impl Authenticator {
     fn poll_service_request<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-        transport: &mut Transport<T>,
+        stream: &mut T,
+        transport: &mut Transport,
     ) -> Poll<Result<(), crate::Error>>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        T: AsyncBufRead + AsyncWrite + Unpin,
     {
         loop {
             match self.state {
                 AuthState::Init => {
                     const PAYLOAD: &[u8] = b"\x05\x00\x00\x00\x0Cssh-userauth";
 
-                    ready!(transport.poll_send_ready(cx))?;
+                    ready!(transport.poll_send_ready(cx, stream))?;
                     transport.fill_buf(&mut &PAYLOAD[..])?;
 
-                    ready!(transport.poll_flush(cx))?;
+                    ready!(transport.poll_flush(cx, stream))?;
 
                     self.state = AuthState::ServiceRequest;
                 }
 
                 AuthState::ServiceRequest => {
-                    let mut payload = ready!(transport.poll_recv(cx, &mut self.recv_buf))?;
+                    let mut payload = ready!(transport.poll_recv(cx, stream, &mut self.recv_buf))?;
 
                     let typ = payload.get_u8();
                     if typ != consts::SSH_MSG_SERVICE_ACCEPT {
@@ -93,26 +94,26 @@ impl Authenticator {
     fn poll_send_userauth_ready<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-        transport: &mut Transport<T>,
+        stream: &mut T,
+        transport: &mut Transport,
     ) -> Poll<Result<(), crate::Error>>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        T: AsyncBufRead + AsyncWrite + Unpin,
     {
-        ready!(self.poll_service_request(cx, transport))?;
-        ready!(transport.poll_send_ready(cx))?;
+        ready!(self.poll_service_request(cx, stream, transport))?;
+        ready!(transport.poll_send_ready(cx, stream))?;
         Poll::Ready(Ok(()))
     }
 
-    fn send_userauth<T, F>(
+    fn send_userauth<F>(
         &mut self,
-        transport: &mut Transport<T>,
+        transport: &mut Transport,
         method_name: &str,
         username: &str,
         fields_len: usize,
         fill_fields: F,
     ) -> Result<(), crate::Error>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
         F: FnOnce(&mut [u8]),
     {
         let payload_length = 27 + username.len() + method_name.len() + fields_len;
@@ -131,14 +132,15 @@ impl Authenticator {
     pub fn poll_userauth_password<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-        transport: &mut Transport<T>,
+        stream: &mut T,
+        transport: &mut Transport,
         username: &str,
         password: &str,
     ) -> Poll<Result<(), crate::Error>>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        T: AsyncBufRead + AsyncWrite + Unpin,
     {
-        ready!(self.poll_send_userauth_ready(cx, transport))?;
+        ready!(self.poll_send_userauth_ready(cx, stream, transport))?;
 
         let fields_len = 1 + 4 + password.len();
         self.send_userauth(transport, "password", username, fields_len, |mut buf| {
@@ -153,22 +155,23 @@ impl Authenticator {
     pub fn poll_authenticate<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-        transport: &mut Transport<T>,
+        stream: &mut T,
+        transport: &mut Transport,
     ) -> Poll<Result<AuthResult, crate::Error>>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        T: AsyncBufRead + AsyncWrite + Unpin,
     {
         loop {
             match self.state {
                 AuthState::Authenticated => return Poll::Ready(Ok(AuthResult::Success)),
 
                 AuthState::Init | AuthState::ServiceRequest => {
-                    ready!(self.poll_service_request(cx, transport))?;
+                    ready!(self.poll_service_request(cx, stream, transport))?;
                 }
 
                 AuthState::AuthRequests => {
-                    ready!(transport.poll_flush(cx))?;
-                    let mut payload = ready!(transport.poll_recv(cx, &mut self.recv_buf))?;
+                    ready!(transport.poll_flush(cx, stream))?;
+                    let mut payload = ready!(transport.poll_recv(cx, stream, &mut self.recv_buf))?;
 
                     let typ = payload.get_u8();
                     match typ {

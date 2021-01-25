@@ -9,7 +9,7 @@ use futures::{
     task::{self, Poll},
 };
 use std::{cmp, collections::HashMap, num};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncBufRead, AsyncWrite};
 
 pub struct Connection {
     initial_window_size: u32,
@@ -44,12 +44,13 @@ impl Connection {
     pub fn poll_channel_open_session<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-        transport: &mut Transport<T>,
+        stream: &mut T,
+        transport: &mut Transport,
     ) -> Poll<Result<ChannelId, crate::Error>>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        T: AsyncBufRead + AsyncWrite + Unpin,
     {
-        ready!(transport.poll_send_ready(cx))?;
+        ready!(transport.poll_send_ready(cx, stream))?;
 
         let sender_channel = self.allocate_channel();
 
@@ -92,19 +93,20 @@ impl Connection {
     pub fn poll_request_exec<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-        transport: &mut Transport<T>,
+        stream: &mut T,
+        transport: &mut Transport,
         channel: ChannelId,
         command: &str,
     ) -> Poll<Result<(), crate::Error>>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        T: AsyncBufRead + AsyncWrite + Unpin,
     {
         let channel = self
             .channels
             .get_mut(&channel)
             .ok_or_else(|| crate::Error::connection("invalid channel id"))?;
 
-        ready!(transport.poll_send_ready(cx))?;
+        ready!(transport.poll_send_ready(cx, stream))?;
 
         transport.fill(18 + command.len(), |mut buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_REQUEST);
@@ -123,18 +125,19 @@ impl Connection {
     pub fn poll_close<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-        transport: &mut Transport<T>,
+        stream: &mut T,
+        transport: &mut Transport,
         channel: ChannelId,
     ) -> Poll<Result<(), crate::Error>>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        T: AsyncBufRead + AsyncWrite + Unpin,
     {
         let channel = match self.channels.get_mut(&channel) {
             Some(ch) => ch,
             None => return Poll::Ready(Ok(())), // do nothing
         };
 
-        ready!(transport.poll_send_ready(cx))?;
+        ready!(transport.poll_send_ready(cx, stream))?;
 
         transport.fill(5, |mut buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_CLOSE);
@@ -149,19 +152,20 @@ impl Connection {
     pub fn poll_window_adjust<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-        transport: &mut Transport<T>,
+        stream: &mut T,
+        transport: &mut Transport,
         channel: ChannelId,
         additional: u32,
     ) -> Poll<Result<(), crate::Error>>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        T: AsyncBufRead + AsyncWrite + Unpin,
     {
         let channel = self
             .channels
             .get_mut(&channel)
             .ok_or_else(|| crate::Error::connection("invalid channel id"))?;
 
-        ready!(transport.poll_send_ready(cx))?;
+        ready!(transport.poll_send_ready(cx, stream))?;
 
         transport.fill(9, |mut buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_WINDOW_ADJUST);
@@ -177,15 +181,16 @@ impl Connection {
     pub fn poll_recv<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-        transport: &mut Transport<T>,
+        stream: &mut T,
+        transport: &mut Transport,
     ) -> Poll<Result<Response, crate::Error>>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        T: AsyncBufRead + AsyncWrite + Unpin,
     {
-        ready!(transport.poll_flush(cx))?;
+        ready!(transport.poll_flush(cx, stream))?;
 
         loop {
-            let mut payload = ready!(transport.poll_recv(cx, &mut self.recv_buf))?;
+            let mut payload = ready!(transport.poll_recv(cx, stream, &mut self.recv_buf))?;
             tracing::trace!("Handle incoming message");
             match payload.get_u8() {
                 // Global request described in https://tools.ietf.org/html/rfc4254#section-4
