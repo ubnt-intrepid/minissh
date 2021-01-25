@@ -25,6 +25,7 @@ pub enum AuthResult {
 
 pub struct Authenticator {
     state: AuthState,
+    recv_buf: Vec<u8>,
 }
 
 enum AuthState {
@@ -38,6 +39,7 @@ impl Default for Authenticator {
     fn default() -> Self {
         Self {
             state: AuthState::Init,
+            recv_buf: vec![],
         }
     }
 }
@@ -65,7 +67,7 @@ impl Authenticator {
                 }
 
                 AuthState::ServiceRequest => {
-                    let mut payload = ready!(transport.poll_recv(cx))?;
+                    let mut payload = ready!(transport.poll_recv(cx, &mut self.recv_buf))?;
 
                     let typ = payload.get_u8();
                     if typ != consts::SSH_MSG_SERVICE_ACCEPT {
@@ -164,7 +166,7 @@ impl Authenticator {
 
                 AuthState::AuthRequests => {
                     ready!(transport.poll_flush(cx))?;
-                    let mut payload = ready!(transport.poll_recv(cx))?;
+                    let mut payload = ready!(transport.poll_recv(cx, &mut self.recv_buf))?;
 
                     let typ = payload.get_u8();
                     match typ {

@@ -14,7 +14,7 @@ use futures::{
     task::{self, Poll},
 };
 use ring::{aead::chacha20_poly1305_openssh as aead, agreement, digest, rand, signature};
-use std::{convert::TryInto as _, io, num, pin::Pin};
+use std::{convert::TryInto as _, io, num, ops::Range, pin::Pin};
 use tokio::io::{
     AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _, BufReader, ReadBuf,
 };
@@ -71,7 +71,7 @@ where
 
     Ok(Transport {
         stream,
-        state: TransportState::Init,
+        state: TransportState::Init(vec![]),
         send: SendPacket::default(),
         recv: RecvPacket::default(),
         kex: KeyExchange::new(client_id, server_id),
@@ -93,7 +93,7 @@ pub struct Transport<T> {
 }
 
 enum TransportState {
-    Init,
+    Init(Vec<u8>),
     Kex,
     Ready,
     Disconnected,
@@ -109,12 +109,12 @@ where
 
         loop {
             match self.state {
-                TransportState::Init => {
+                TransportState::Init(ref mut recv_buf) => {
                     tracing::trace!("--> Init");
 
-                    ready!(self.recv.poll_recv(cx, &mut self.stream))?;
+                    let range = ready!(self.recv.poll_recv(cx, &mut self.stream, recv_buf))?;
 
-                    let mut payload = self.recv.payload();
+                    let mut payload = &recv_buf[range];
 
                     match peek_u8(&payload) {
                         Some(consts::SSH_MSG_DISCONNECT) => {
@@ -150,23 +150,32 @@ where
         }
     }
 
-    pub(crate) fn poll_recv(
+    pub(crate) fn poll_recv<'a>(
         &mut self,
         cx: &mut task::Context<'_>,
-    ) -> Poll<Result<Payload<'_>, crate::Error>> {
+        recv_buf: &'a mut Vec<u8>,
+    ) -> Poll<Result<&'a [u8], crate::Error>> {
+        let range = ready!(self.poll_recv_imp(cx, recv_buf))?;
+        Poll::Ready(Ok(&recv_buf[range]))
+    }
+
+    fn poll_recv_imp(
+        &mut self,
+        cx: &mut task::Context<'_>,
+        recv_buf: &mut Vec<u8>,
+    ) -> Poll<Result<Range<usize>, crate::Error>> {
         let span = tracing::trace_span!("Transport::poll_recv");
         let _enter = span.enter();
 
         loop {
             match self.state {
-                TransportState::Init => panic!("called before poll_handshake() completed"),
+                TransportState::Init(..) => panic!("called before poll_handshake() completed"),
 
                 TransportState::Ready => {
                     tracing::trace!("--> Ready");
 
-                    ready!(self.recv.poll_recv(cx, &mut self.stream))?;
-
-                    let mut payload = self.recv.payload();
+                    let range = ready!(self.recv.poll_recv(cx, &mut self.stream, recv_buf))?;
+                    let mut payload = &recv_buf[range.clone()];
 
                     match peek_u8(&payload) {
                         Some(consts::SSH_MSG_DISCONNECT) => {
@@ -178,8 +187,7 @@ where
                         Some(consts::SSH_MSG_DEBUG) => { /* ignore for simplicity */ }
                         Some(consts::SSH_MSG_UNIMPLEMENTED) => {
                             // Bypassed since it was caused by the upper layer.
-                            payload.forget();
-                            break;
+                            return Poll::Ready(Ok(range));
                         }
 
                         Some(consts::SSH_MSG_KEXINIT) => {
@@ -188,15 +196,9 @@ where
                             self.state = TransportState::Kex;
                         }
 
-                        Some(typ) if matches!(self.state, TransportState::Init) => {
-                            tracing::trace!("--> {}, state=TransportState::Init", typ);
-                            /* ignore packet */
-                        }
-
                         Some(typ) => {
                             tracing::trace!("--> {}, state=TransportState::Ready", typ);
-                            payload.forget();
-                            break;
+                            return Poll::Ready(Ok(range));
                         }
 
                         None => panic!("payload is too short"),
@@ -213,13 +215,6 @@ where
                 }
             }
         }
-
-        assert!(
-            matches!(self.state, TransportState::Ready),
-            "packet is not ready"
-        );
-
-        Poll::Ready(Ok(self.recv.payload()))
     }
 
     pub(crate) fn poll_send_ready(
@@ -231,7 +226,7 @@ where
 
         loop {
             match self.state {
-                TransportState::Init => panic!("called before poll_handshake() completed"),
+                TransportState::Init(..) => panic!("called before poll_handshake() completed"),
 
                 TransportState::Kex => {
                     tracing::trace!("--> Kex");
@@ -446,7 +441,6 @@ impl SendPacket {
 // ==== RecvPacket ====
 
 struct RecvPacket {
-    buf: Vec<u8>,
     packet_length: u32,
     state: RecvPacketState,
     seqn: num::Wrapping<u32>,
@@ -454,18 +448,16 @@ struct RecvPacket {
 }
 
 enum RecvPacketState {
+    Ready,
     ReadingLength(usize),
     ReadingPacket(usize),
-    Ready,
-    Consumed,
 }
 
 impl Default for RecvPacket {
     fn default() -> Self {
         Self {
-            buf: vec![0u8; 4],
             packet_length: 0,
-            state: RecvPacketState::ReadingLength(0),
+            state: RecvPacketState::Ready,
             seqn: num::Wrapping(0),
             key: OpeningKey::ClearText,
         }
@@ -474,13 +466,12 @@ impl Default for RecvPacket {
 
 impl RecvPacket {
     /// Attempt to receive a packet from underlying I/O, and decrypt the ciphertext.
-    ///
-    /// This method does nothing when the previous packet is not used.
     fn poll_recv<T>(
         &mut self,
         cx: &mut task::Context<'_>,
         stream: &mut T,
-    ) -> Poll<Result<(), crate::Error>>
+        buf: &mut Vec<u8>,
+    ) -> Poll<Result<Range<usize>, crate::Error>>
     where
         T: AsyncRead + Unpin,
     {
@@ -492,23 +483,18 @@ impl RecvPacket {
             match self.state {
                 RecvPacketState::Ready => {
                     tracing::trace!("--> Ready");
-                    return Poll::Ready(Ok(()));
-                }
-
-                RecvPacketState::Consumed => {
-                    tracing::trace!("--> Consumed");
                     unsafe {
                         // zeroing previous cleartext.
-                        std::ptr::write_bytes(self.buf.as_mut_ptr(), 0, self.buf.len());
+                        std::ptr::write_bytes(buf.as_mut_ptr(), 0, buf.len());
                     }
-                    self.buf.resize(4, 0u8);
+                    buf.resize(4, 0u8);
                     self.state = RecvPacketState::ReadingLength(0);
                 }
 
                 RecvPacketState::ReadingLength(ref mut read) => {
                     tracing::trace!("--> ReadingLength({})", read);
 
-                    let mut read_buf = ReadBuf::new(&mut self.buf[..4]);
+                    let mut read_buf = ReadBuf::new(&mut buf[..4]);
                     read_buf.set_filled(*read);
 
                     loop {
@@ -527,22 +513,21 @@ impl RecvPacket {
                         }
                     }
 
-                    let encrypted_packet_length = &self.buf[..4];
+                    let encrypted_packet_length = &buf[..4];
                     let packet_length = self
                         .key
                         .decrypt_packet_length(self.seqn.0, encrypted_packet_length);
                     tracing::trace!("packet_lenghth = {}", packet_length);
 
                     self.packet_length = packet_length;
-                    self.buf
-                        .resize(4 + packet_length as usize + self.key.tag_len(), 0);
+                    buf.resize(4 + packet_length as usize + self.key.tag_len(), 0);
                     self.state = RecvPacketState::ReadingPacket(4);
                 }
 
                 RecvPacketState::ReadingPacket(ref mut read) => {
                     tracing::trace!("--> ReadingPacket({})", read);
 
-                    let mut read_buf = ReadBuf::new(&mut self.buf[..]);
+                    let mut read_buf = ReadBuf::new(&mut buf[..]);
                     read_buf.set_filled(*read);
 
                     while read_buf.remaining() > 0 {
@@ -551,70 +536,20 @@ impl RecvPacket {
                         *read = read_buf.filled().len();
                     }
 
-                    let (ciphertext, tag) = self.buf.split_at_mut(4 + self.packet_length as usize);
+                    let (ciphertext, tag) = buf.split_at_mut(4 + self.packet_length as usize);
                     debug_assert_eq!(tag.len(), self.key.tag_len());
                     self.key.open_in_place(self.seqn.0, ciphertext, tag)?;
 
                     self.seqn += num::Wrapping(1);
                     self.state = RecvPacketState::Ready;
 
-                    return Poll::Ready(Ok(()));
+                    let padding_length = buf[4];
+                    let payload_length = self.packet_length as usize - padding_length as usize - 1;
+
+                    return Poll::Ready(Ok(5..5 + payload_length));
                 }
             }
         }
-    }
-
-    #[track_caller]
-    fn payload(&mut self) -> Payload<'_> {
-        assert!(
-            matches!(self.state, RecvPacketState::Ready),
-            "cleartext is not ready to read"
-        );
-        Payload {
-            recv: &mut *self,
-            pos: 0,
-            consume_on_drop: true,
-        }
-    }
-
-    fn payload_raw(&self) -> &[u8] {
-        let padding_length = self.buf[4];
-        let payload_length = self.packet_length as usize - padding_length as usize - 1;
-        &self.buf[5..5 + payload_length]
-    }
-}
-
-pub(crate) struct Payload<'t> {
-    recv: &'t mut RecvPacket,
-    pos: usize,
-    consume_on_drop: bool,
-}
-
-impl Buf for Payload<'_> {
-    fn remaining(&self) -> usize {
-        self.recv.payload_raw().len() - self.pos
-    }
-
-    fn chunk(&self) -> &[u8] {
-        &self.recv.payload_raw()[self.pos..]
-    }
-
-    fn advance(&mut self, amt: usize) {
-        self.pos = std::cmp::min(self.pos + amt, self.recv.payload_raw().len());
-    }
-}
-
-impl Drop for Payload<'_> {
-    fn drop(&mut self) {
-        if self.consume_on_drop {
-            self.recv.state = RecvPacketState::Consumed;
-        }
-    }
-}
-
-impl Payload<'_> {
-    pub(crate) fn forget(&mut self) {
-        self.consume_on_drop = false;
     }
 }
 
@@ -628,6 +563,7 @@ struct KeyExchange {
     digest: Option<digest::Context>,
     state: KeyExchangeState,
     output: Option<(aead::OpeningKey, aead::SealingKey, digest::Digest)>,
+    recv_buf: Vec<u8>,
 }
 
 enum KeyExchangeState {
@@ -650,6 +586,7 @@ impl KeyExchange {
             digest: None,
             state: KeyExchangeState::Init,
             output: None,
+            recv_buf: vec![],
         }
     }
 
@@ -747,12 +684,12 @@ impl KeyExchange {
                     tracing::trace!("--> ReceivingEcdhReply");
 
                     ready!(send.poll_flush(cx, stream))?;
-                    ready!(recv.poll_recv(cx, stream))?;
+                    let range = ready!(recv.poll_recv(cx, stream, &mut self.recv_buf))?;
 
                     let mut digest = self.digest.take().unwrap();
                     let client_public_key = self.client_public_key();
 
-                    let mut payload = recv.payload();
+                    let mut payload = &self.recv_buf[range];
 
                     if payload.get_u8() != consts::SSH_MSG_KEX_ECDH_REPLY {
                         return Poll::Ready(Err(crate::Error::transport(
@@ -882,9 +819,9 @@ impl KeyExchange {
                     tracing::trace!("--> ReceivingServerNewKeys");
 
                     ready!(send.poll_flush(cx, stream))?;
-                    ready!(recv.poll_recv(cx, stream))?;
+                    let range = ready!(recv.poll_recv(cx, stream, &mut self.recv_buf))?;
 
-                    let mut payload = recv.payload();
+                    let mut payload = &self.recv_buf[range];
 
                     if payload.get_u8() != consts::SSH_MSG_NEWKEYS {
                         // TODO: send DISCONNECT

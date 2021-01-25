@@ -16,6 +16,7 @@ pub struct Connection {
     maximum_packet_size: u32,
     channels: HashMap<ChannelId, Channel>,
     next_channel_id: num::Wrapping<u32>,
+    recv_buf: Vec<u8>,
 }
 
 impl Default for Connection {
@@ -25,6 +26,7 @@ impl Default for Connection {
             maximum_packet_size: 0x8000,
             channels: HashMap::new(),
             next_channel_id: num::Wrapping(0),
+            recv_buf: vec![],
         }
     }
 }
@@ -185,7 +187,7 @@ impl Connection {
         ready!(transport.poll_flush(cx))?;
 
         loop {
-            let mut payload = ready!(transport.poll_recv(cx))?;
+            let mut payload = ready!(transport.poll_recv(cx, &mut self.recv_buf))?;
             tracing::trace!("Handle incoming message");
             match payload.get_u8() {
                 // Global request described in https://tools.ietf.org/html/rfc4254#section-4
