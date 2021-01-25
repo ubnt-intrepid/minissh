@@ -103,6 +103,53 @@ impl<T> Transport<T>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    pub fn poll_handshake(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
+        let span = tracing::trace_span!("Transport::poll_handshake");
+        let _enter = span.enter();
+
+        loop {
+            match self.state {
+                TransportState::Init => {
+                    tracing::trace!("--> Init");
+
+                    ready!(self.recv.poll_recv(cx, &mut self.stream))?;
+
+                    let mut payload = self.recv.payload();
+
+                    match peek_u8(&payload) {
+                        Some(consts::SSH_MSG_DISCONNECT) => {
+                            // TODO: parse disconnect message
+                            self.state = TransportState::Disconnected;
+                        }
+
+                        Some(consts::SSH_MSG_KEXINIT) => {
+                            tracing::trace!("--> KEXINIT");
+                            self.kex.start(&mut payload, &self.rng)?;
+                            self.state = TransportState::Kex;
+                        }
+
+                        Some(typ) => {
+                            tracing::trace!("--> {}, ignoring", typ);
+                        }
+
+                        None => panic!("payload is too short"),
+                    }
+                }
+
+                TransportState::Kex => {
+                    tracing::trace!("--> Kex");
+                    ready!(self.poll_kex(cx))?;
+                }
+
+                TransportState::Ready => return Poll::Ready(Ok(())),
+
+                TransportState::Disconnected => {
+                    return Poll::Ready(Err(crate::Error::transport("disconnected")));
+                }
+            }
+        }
+    }
+
     pub(crate) fn poll_recv(
         &mut self,
         cx: &mut task::Context<'_>,
@@ -112,8 +159,10 @@ where
 
         loop {
             match self.state {
-                TransportState::Init | TransportState::Ready => {
-                    tracing::trace!("--> Init|Ready");
+                TransportState::Init => panic!("called before poll_handshake() completed"),
+
+                TransportState::Ready => {
+                    tracing::trace!("--> Ready");
 
                     ready!(self.recv.poll_recv(cx, &mut self.stream))?;
 
@@ -182,41 +231,7 @@ where
 
         loop {
             match self.state {
-                TransportState::Init => {
-                    tracing::trace!("--> Init");
-
-                    ready!(self.recv.poll_recv(cx, &mut self.stream))?;
-
-                    let mut payload = self.recv.payload();
-
-                    match peek_u8(&payload) {
-                        Some(consts::SSH_MSG_DISCONNECT) => {
-                            // TODO: parse disconnect message
-                            self.state = TransportState::Disconnected;
-                        }
-
-                        Some(consts::SSH_MSG_IGNORE) => { /* ignore silently */ }
-                        Some(consts::SSH_MSG_DEBUG) => { /* ignore for simplicity */ }
-                        Some(consts::SSH_MSG_UNIMPLEMENTED) => {
-                            // Bypassed since it was caused by the upper layer.
-                            payload.forget();
-                        }
-
-                        Some(consts::SSH_MSG_KEXINIT) => {
-                            tracing::trace!("--> KEXINIT");
-                            self.kex.start(&mut payload, &self.rng)?;
-                            self.state = TransportState::Kex;
-                        }
-
-                        Some(typ) => {
-                            tracing::trace!("--> {}, state=TransportState::Init", typ);
-                            payload.forget();
-                            self.state = TransportState::Ready;
-                        }
-
-                        None => panic!("payload is too short"),
-                    }
-                }
+                TransportState::Init => panic!("called before poll_handshake() completed"),
 
                 TransportState::Kex => {
                     tracing::trace!("--> Kex");

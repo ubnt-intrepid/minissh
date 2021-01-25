@@ -14,6 +14,7 @@ async fn main() -> Result<()> {
 
     tracing::debug!("establish SSH transport");
     let mut transport = minissh::transport::establish(stream).await?;
+    poll_fn(|cx| transport.poll_handshake(cx)).await?;
 
     tracing::debug!("userauth");
     let mut userauth = minissh::userauth::Authenticator::default();
