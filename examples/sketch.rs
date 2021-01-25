@@ -7,6 +7,35 @@ use tokio::net::TcpStream;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
+    let mut agent = minissh::agent::Agent::connect().await?;
+
+    tracing::trace!("request identities");
+    poll_fn(|cx| {
+        futures::ready!(agent.poll_flush(cx))?;
+        agent.send_request_identities().into()
+    })
+    .await?;
+    tracing::trace!("fetch identities");
+    let identity = match poll_fn(|cx| agent.poll_recv(cx)).await? {
+        minissh::agent::Response::Identities(ident) => ident.into_iter().next().unwrap(),
+        _ => panic!("unexpected response type"),
+    };
+    tracing::trace!("--> {:?}", identity);
+
+    tracing::trace!("sign data");
+    poll_fn(|cx| {
+        futures::ready!(agent.poll_flush(cx))?;
+        agent
+            .send_sign_request(&identity, &mut &b"foo"[..], 0)
+            .into()
+    })
+    .await?;
+    let signature = match poll_fn(|cx| agent.poll_recv(cx)).await? {
+        minissh::agent::Response::SignResponse(sig) => sig,
+        _ => panic!("unexpected response type"),
+    };
+    tracing::trace!("--> {:?}", String::from_utf8_lossy(&signature));
+
     let addr = SocketAddr::from(([192, 168, 122, 10], 22));
 
     tracing::debug!("connect to SSH server (addr = {})", addr);

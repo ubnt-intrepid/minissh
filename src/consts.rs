@@ -33,3 +33,31 @@ pub(crate) const SSH_MSG_CHANNEL_CLOSE: u8 = 97;
 pub(crate) const SSH_MSG_CHANNEL_REQUEST: u8 = 98;
 pub(crate) const SSH_MSG_CHANNEL_SUCCESS: u8 = 99;
 pub(crate) const SSH_MSG_CHANNEL_FAILURE: u8 = 100;
+
+// SSH agent protocol numbers defined in https://tools.ietf.org/html/draft-miller-ssh-agent-04#section-7.1
+pub(crate) const SSH_AGENT_FAILURE: u8 = 5;
+pub(crate) const SSH_AGENT_SUCCESS: u8 = 6;
+pub(crate) const SSH_AGENTC_REQUEST_IDENTITIES: u8 = 11;
+pub(crate) const SSH_AGENT_IDENTITIES_ANSWER: u8 = 12;
+pub(crate) const SSH_AGENTC_SIGN_REQUEST: u8 = 13;
+pub(crate) const SSH_AGENT_SIGN_RESPONSE: u8 = 14;
+pub(crate) const SSH_AGENTC_ADD_IDENTITY: u8 = 17;
+pub(crate) const SSH_AGENTC_REMOVE_IDENTITY: u8 = 18;
+pub(crate) const SSH_AGENTC_REMOVE_ALL_IDENTITIES: u8 = 19;
+pub(crate) const SSH_AGENTC_ADD_SMARTCARD_KEY: u8 = 20;
+pub(crate) const SSH_AGENTC_REMOVE_SMARTCARD_KEY: u8 = 21;
+pub(crate) const SSH_AGENTC_LOCK: u8 = 22;
+pub(crate) const SSH_AGENTC_UNLOCK: u8 = 23;
+pub(crate) const SSH_AGENTC_ADD_ID_CONSTRAINED: u8 = 25;
+pub(crate) const SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED: u8 = 26;
+pub(crate) const SSH_AGENTC_EXTENSION: u8 = 27;
+pub(crate) const SSH_AGENT_EXTENSION_FAILURE: u8 = 28;
+
+// SSH agent key constraint numbers defined in https://tools.ietf.org/html/draft-miller-ssh-agent-04#section-7.2
+pub(crate) const SSH_AGENT_CONSTRAIN_LIFETIME: u8 = 1;
+pub(crate) const SSH_AGENT_CONSTRAIN_CONFIRM: u8 = 2;
+pub(crate) const SSH_AGENT_CONSTRAIN_EXTENSION: u8 = 255;
+
+// SSH agent signature flags defined in https://tools.ietf.org/html/draft-miller-ssh-agent-04#section-7.3
+pub(crate) const SSH_AGENT_RSA_SHA2_256: u8 = 0x02;
+pub(crate) const SSH_AGENT_RSA_SHA2_512: u8 = 0x04;
