@@ -103,25 +103,26 @@ impl Authenticator {
         Poll::Ready(Ok(()))
     }
 
-    fn send_userauth<T, B>(
+    fn send_userauth<T, F>(
         &mut self,
         transport: &mut Transport<T>,
         method_name: &str,
         username: &str,
-        fields: &mut B,
+        fields_len: usize,
+        fill_fields: F,
     ) -> Result<(), crate::Error>
     where
         T: AsyncRead + AsyncWrite + Unpin,
-        B: Buf,
+        F: FnOnce(&mut [u8]),
     {
-        let mut header = vec![];
-        header.put_u8(consts::SSH_MSG_USERAUTH_REQUEST);
-        put_ssh_string(&mut header, username.as_ref());
-        put_ssh_string(&mut header, b"ssh-connection"); // service name
-        put_ssh_string(&mut header, method_name.as_ref()); // method name
-
-        let mut payload = Buf::chain(&header[..], fields);
-        transport.fill_buf(&mut payload)?;
+        let payload_length = 27 + username.len() + method_name.len() + fields_len;
+        transport.fill(payload_length, |mut buf| {
+            buf.put_u8(consts::SSH_MSG_USERAUTH_REQUEST);
+            put_ssh_string(&mut buf, username.as_ref());
+            put_ssh_string(&mut buf, b"ssh-connection"); // service name
+            put_ssh_string(&mut buf, method_name.as_ref()); // method name
+            fill_fields(buf);
+        })?;
 
         Ok(())
     }
@@ -139,10 +140,11 @@ impl Authenticator {
     {
         ready!(self.poll_send_userauth_ready(cx, transport))?;
 
-        let mut fields = vec![];
-        fields.put_u8(0); // FALSE
-        put_ssh_string(&mut fields, password.as_ref());
-        self.send_userauth(transport, "password", username, &mut &fields[..])?;
+        let fields_len = 1 + 4 + password.len();
+        self.send_userauth(transport, "password", username, fields_len, |mut buf| {
+            buf.put_u8(0); // FALSE
+            put_ssh_string(&mut buf, password.as_ref());
+        })?;
 
         Poll::Ready(Ok(()))
     }

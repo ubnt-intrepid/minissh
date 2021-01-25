@@ -53,14 +53,14 @@ impl Connection {
 
         let sender_channel = self.allocate_channel();
 
-        let mut payload = vec![];
-        payload.put_u8(consts::SSH_MSG_CHANNEL_OPEN);
-        put_ssh_string(&mut payload, b"session");
-        payload.put_u32(sender_channel.0);
-        payload.put_u32(self.initial_window_size);
-        payload.put_u32(self.maximum_packet_size);
-
-        transport.fill_buf(&mut &payload[..])?;
+        transport.fill(24, |mut buf| {
+            buf.put_u8(consts::SSH_MSG_CHANNEL_OPEN);
+            put_ssh_string(&mut buf, b"session");
+            buf.put_u32(sender_channel.0);
+            buf.put_u32(self.initial_window_size);
+            buf.put_u32(self.maximum_packet_size);
+            debug_assert!(buf.is_empty());
+        })?;
 
         Poll::Ready(Ok(sender_channel))
     }
@@ -106,14 +106,14 @@ impl Connection {
 
         ready!(transport.poll_send_ready(cx))?;
 
-        let mut payload = vec![];
-        payload.put_u8(consts::SSH_MSG_CHANNEL_REQUEST);
-        payload.put_u32(channel.recipient_id.0);
-        put_ssh_string(&mut payload, b"exec");
-        payload.put_u8(0); // want_reply=FALSE
-        put_ssh_string(&mut payload, command.as_ref());
-
-        transport.fill_buf(&mut &payload[..])?;
+        transport.fill(18 + command.len(), |mut buf| {
+            buf.put_u8(consts::SSH_MSG_CHANNEL_REQUEST);
+            buf.put_u32(channel.recipient_id.0);
+            put_ssh_string(&mut buf, b"exec");
+            buf.put_u8(0); // want_reply=FALSE
+            put_ssh_string(&mut buf, command.as_ref());
+            debug_assert!(buf.is_empty());
+        })?;
 
         // TODO: mark send state.
 
@@ -136,11 +136,10 @@ impl Connection {
 
         ready!(transport.poll_send_ready(cx))?;
 
-        let mut payload = vec![];
-        payload.put_u8(consts::SSH_MSG_CHANNEL_CLOSE);
-        payload.put_u32(channel.recipient_id.0);
-
-        transport.fill_buf(&mut &payload[..])?;
+        transport.fill(5, |mut buf| {
+            buf.put_u8(consts::SSH_MSG_CHANNEL_CLOSE);
+            buf.put_u32(channel.recipient_id.0);
+        })?;
 
         channel.state = ChannelState::Closing;
 
@@ -164,12 +163,11 @@ impl Connection {
 
         ready!(transport.poll_send_ready(cx))?;
 
-        let mut payload = vec![];
-        payload.put_u8(consts::SSH_MSG_CHANNEL_WINDOW_ADJUST);
-        payload.put_u32(channel.recipient_id.0);
-        payload.put_u32(additional);
-
-        transport.fill_buf(&mut &payload[..])?;
+        transport.fill(9, |mut buf| {
+            buf.put_u8(consts::SSH_MSG_CHANNEL_WINDOW_ADJUST);
+            buf.put_u32(channel.recipient_id.0);
+            buf.put_u32(additional);
+        })?;
 
         channel.recipient_window_size = channel.recipient_window_size.saturating_add(additional);
 
