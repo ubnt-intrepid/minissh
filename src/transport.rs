@@ -150,16 +150,17 @@ where
         }
     }
 
+    #[inline]
     pub(crate) fn poll_recv<'a>(
         &mut self,
         cx: &mut task::Context<'_>,
         recv_buf: &'a mut Vec<u8>,
     ) -> Poll<Result<&'a [u8], crate::Error>> {
-        let range = ready!(self.poll_recv_imp(cx, recv_buf))?;
-        Poll::Ready(Ok(&recv_buf[range]))
+        self.poll_recv_inner(cx, recv_buf)
+            .map_ok(move |range| &recv_buf[range])
     }
 
-    fn poll_recv_imp(
+    fn poll_recv_inner(
         &mut self,
         cx: &mut task::Context<'_>,
         recv_buf: &mut Vec<u8>,
@@ -246,28 +247,7 @@ where
         }
     }
 
-    pub(crate) fn fill_buf<B>(&mut self, payload: &mut B) -> Result<(), crate::Error>
-    where
-        B: Buf,
-    {
-        let span = tracing::trace_span!("Transport::send");
-        let _enter = span.enter();
-
-        assert!(
-            matches!(self.state, TransportState::Ready),
-            "transport is not ready to send"
-        );
-
-        self.send.fill_buf(payload)?;
-
-        Ok(())
-    }
-
-    pub(crate) fn fill_buf_in_place<F>(
-        &mut self,
-        payload_length: usize,
-        filler: F,
-    ) -> Result<(), crate::Error>
+    pub(crate) fn fill<F>(&mut self, payload_length: usize, filler: F) -> Result<(), crate::Error>
     where
         F: FnOnce(&mut [u8]),
     {
@@ -279,9 +259,17 @@ where
             "transport is not ready to send"
         );
 
-        self.send.fill_buf_in_place(payload_length, filler)?;
+        self.send.fill(payload_length, filler)?;
 
         Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn fill_buf<B>(&mut self, payload: &mut B) -> Result<(), crate::Error>
+    where
+        B: Buf,
+    {
+        self.fill(payload.remaining(), |buf| payload.copy_to_slice(buf))
     }
 
     pub(crate) fn poll_flush(
@@ -356,12 +344,10 @@ impl SendPacket {
     where
         B: Buf,
     {
-        self.fill_buf_in_place(payload.remaining(), |buf| {
-            payload.copy_to_slice(buf);
-        })
+        self.fill(payload.remaining(), |buf| payload.copy_to_slice(buf))
     }
 
-    fn fill_buf_in_place<F>(&mut self, payload_length: usize, filler: F) -> Result<(), crate::Error>
+    fn fill<F>(&mut self, payload_length: usize, filler: F) -> Result<(), crate::Error>
     where
         F: FnOnce(&mut [u8]),
     {
