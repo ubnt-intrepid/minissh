@@ -73,9 +73,11 @@ where
         stream,
         state: TransportState::Init,
         send: SendPacket::default(),
+        send_buf: vec![],
         recv: RecvPacket::default(),
         kex: KeyExchange::new(client_id, server_id),
         session_id: None,
+        rng: rand::SystemRandom::new(),
     })
 }
 
@@ -85,9 +87,11 @@ pub struct Transport<T> {
     stream: BufReader<T>,
     state: TransportState,
     send: SendPacket,
+    send_buf: Vec<u8>,
     recv: RecvPacket,
     kex: KeyExchange,
     session_id: Option<digest::Digest>,
+    rng: rand::SystemRandom,
 }
 
 enum TransportState {
@@ -133,7 +137,7 @@ where
 
                         Some(consts::SSH_MSG_KEXINIT) => {
                             tracing::trace!("--> KEXINIT");
-                            self.kex.start(&mut payload)?;
+                            self.kex.start(&mut payload, &self.rng)?;
                             self.state = TransportState::Kex;
                         }
 
@@ -202,7 +206,7 @@ where
 
                         Some(consts::SSH_MSG_KEXINIT) => {
                             tracing::trace!("--> KEXINIT");
-                            self.kex.start(&mut payload)?;
+                            self.kex.start(&mut payload, &self.rng)?;
                             self.state = TransportState::Kex;
                         }
 
@@ -223,7 +227,9 @@ where
 
                 TransportState::Ready => {
                     tracing::trace!("--> Ready");
-                    ready!(self.send.poll_flush(cx, &mut self.stream))?;
+                    ready!(self
+                        .send
+                        .poll_flush(cx, &mut self.stream, &self.send_buf[..]))?;
                     return Poll::Ready(Ok(()));
                 }
 
@@ -246,7 +252,7 @@ where
             "transport is not ready to send"
         );
 
-        self.send.fill_buf(payload)?;
+        self.send.fill_buf(payload, &mut self.send_buf)?;
 
         Ok(())
     }
@@ -258,8 +264,8 @@ where
         let span = tracing::trace_span!("Transport::poll_flush");
         let _enter = span.enter();
 
-        // a
-        self.send.poll_flush(cx, &mut self.stream)
+        self.send
+            .poll_flush(cx, &mut self.stream, &self.send_buf[..])
     }
 
     fn poll_kex(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
@@ -272,6 +278,7 @@ where
             cx,
             &mut self.stream,
             &mut self.send,
+            &mut self.send_buf,
             &mut self.recv,
             self.session_id.as_ref(),
         ))?;
@@ -295,7 +302,6 @@ where
 // ==== SendPacket ====
 
 struct SendPacket {
-    buf: Vec<u8>,
     state: SendPacketState,
     seqn: num::Wrapping<u32>,
     key: SealingKey,
@@ -310,7 +316,6 @@ enum SendPacketState {
 impl Default for SendPacket {
     fn default() -> Self {
         Self {
-            buf: vec![],
             state: SendPacketState::Available,
             seqn: num::Wrapping(0),
             key: SealingKey::ClearText,
@@ -319,7 +324,7 @@ impl Default for SendPacket {
 }
 
 impl SendPacket {
-    fn fill_buf<B>(&mut self, payload: &mut B) -> Result<(), crate::Error>
+    fn fill_buf<B>(&mut self, payload: &mut B, buf: &mut Vec<u8>) -> Result<(), crate::Error>
     where
         B: Buf,
     {
@@ -334,9 +339,9 @@ impl SendPacket {
         tracing::trace!("padding_length = {}", padding_length);
 
         tracing::trace!("fill send_buffer");
-        self.buf.resize(4 + packet_length + self.key.tag_len(), 0);
+        buf.resize(4 + packet_length + self.key.tag_len(), 0);
         {
-            let mut buf = &mut self.buf[..4 + packet_length];
+            let mut buf = &mut buf[..4 + packet_length];
             buf.put_u32(packet_length as u32);
             buf.put_u8(padding_length as u8);
             while payload.has_remaining() {
@@ -356,7 +361,7 @@ impl SendPacket {
 
         tracing::trace!("encrypt packet");
         {
-            let (packet, tag) = self.buf.split_at_mut(4 + packet_length);
+            let (packet, tag) = buf.split_at_mut(4 + packet_length);
             assert_eq!(tag.len(), self.key.tag_len());
             self.key.seal_in_place(self.seqn.0, packet, tag)?;
         }
@@ -371,6 +376,7 @@ impl SendPacket {
         &mut self,
         cx: &mut task::Context<'_>,
         stream: &mut T,
+        mut buf: &[u8],
     ) -> Poll<Result<(), crate::Error>>
     where
         T: AsyncWrite + Unpin,
@@ -381,7 +387,6 @@ impl SendPacket {
                 SendPacketState::Available => return Poll::Ready(Ok(())),
 
                 SendPacketState::Writing(ref mut written) => {
-                    let mut buf = &self.buf[..];
                     while buf.has_remaining() {
                         let amt = ready!(stream.as_mut().poll_write(cx, buf.chunk()))
                             .map_err(crate::Error::io)?;
@@ -586,7 +591,6 @@ struct KeyExchange {
     digest: Option<digest::Context>,
     state: KeyExchangeState,
     output: Option<(aead::OpeningKey, aead::SealingKey, digest::Digest)>,
-    rng: rand::SystemRandom,
 }
 
 enum KeyExchangeState {
@@ -609,11 +613,14 @@ impl KeyExchange {
             digest: None,
             state: KeyExchangeState::Init,
             output: None,
-            rng: rand::SystemRandom::new(),
         }
     }
 
-    fn start<B>(&mut self, server_kexinit_payload: &mut B) -> Result<(), crate::Error>
+    fn start<B>(
+        &mut self,
+        server_kexinit_payload: &mut B,
+        rng: &rand::SystemRandom,
+    ) -> Result<(), crate::Error>
     where
         B: Buf,
     {
@@ -631,17 +638,15 @@ impl KeyExchange {
 
         // set client kexinit.
         tracing::trace!("init client_kex_payload");
-        self.client_kexinit_payload = client_kex_payload(&self.rng)?;
+        self.client_kexinit_payload = client_kex_payload(rng)?;
         digest_ssh_string(&mut digest, &self.client_kexinit_payload[..]);
         digest_ssh_string(&mut digest, server_kexinit_payload);
 
         // Generate ephemeral ECDH key.
         tracing::trace!("init ephemeral ECDH key");
         self.client_ephemeral_key = Some({
-            let private_key =
-                agreement::EphemeralPrivateKey::generate(&agreement::X25519, &self.rng).map_err(
-                    |_| crate::Error::transport("failed to generate ephemeral private key"),
-                )?;
+            let private_key = agreement::EphemeralPrivateKey::generate(&agreement::X25519, rng)
+                .map_err(|_| crate::Error::transport("failed to generate ephemeral private key"))?;
             let public_key = private_key
                 .compute_public_key()
                 .map_err(|_| crate::Error::transport("failed to compute ephemeral public key"))?;
@@ -668,6 +673,7 @@ impl KeyExchange {
         cx: &mut task::Context<'_>,
         stream: &mut T,
         send: &mut SendPacket,
+        send_buf: &mut Vec<u8>,
         recv: &mut RecvPacket,
         session_id: Option<&digest::Digest>,
     ) -> Poll<Result<(aead::OpeningKey, aead::SealingKey, digest::Digest), crate::Error>>
@@ -682,21 +688,21 @@ impl KeyExchange {
                 KeyExchangeState::SendingClientKexInit => {
                     tracing::trace!("--> SendingClientKexInit");
 
-                    ready!(send.poll_flush(cx, stream))?;
-                    send.fill_buf(&mut &self.client_kexinit_payload[..])?;
+                    ready!(send.poll_flush(cx, stream, &send_buf[..]))?;
+                    send.fill_buf(&mut &self.client_kexinit_payload[..], send_buf)?;
                     self.state = KeyExchangeState::SendingEcdhInit;
                 }
 
                 KeyExchangeState::SendingEcdhInit => {
                     tracing::trace!("--> SendingEcdhInit");
 
-                    ready!(send.poll_flush(cx, stream))?;
+                    ready!(send.poll_flush(cx, stream, &send_buf[..]))?;
 
                     let mut payload = vec![];
                     payload.put_u8(consts::SSH_MSG_KEX_ECDH_INIT);
                     put_ssh_string(&mut payload, self.client_public_key().as_ref());
 
-                    send.fill_buf(&mut &payload[..])?;
+                    send.fill_buf(&mut &payload[..], send_buf)?;
 
                     self.state = KeyExchangeState::ReceivingEcdhReply;
                 }
@@ -704,7 +710,7 @@ impl KeyExchange {
                 KeyExchangeState::ReceivingEcdhReply => {
                     tracing::trace!("--> ReceivingEcdhReply");
 
-                    ready!(send.poll_flush(cx, stream))?;
+                    ready!(send.poll_flush(cx, stream, &send_buf[..]))?;
                     ready!(recv.poll_recv(cx, stream))?;
 
                     let mut digest = self.digest.take().unwrap();
@@ -827,11 +833,11 @@ impl KeyExchange {
                 KeyExchangeState::SendingClientNewKeys => {
                     tracing::trace!("--> SendingClientNewKeys");
 
-                    ready!(send.poll_flush(cx, stream))?;
+                    ready!(send.poll_flush(cx, stream, &send_buf[..]))?;
 
                     let mut payload = vec![];
                     payload.put_u8(consts::SSH_MSG_NEWKEYS);
-                    send.fill_buf(&mut &payload[..])?;
+                    send.fill_buf(&mut &payload[..], send_buf)?;
 
                     self.state = KeyExchangeState::ReceivingServerNewKeys;
                 }
@@ -839,7 +845,7 @@ impl KeyExchange {
                 KeyExchangeState::ReceivingServerNewKeys => {
                     tracing::trace!("--> ReceivingServerNewKeys");
 
-                    ready!(send.poll_flush(cx, stream))?;
+                    ready!(send.poll_flush(cx, stream, &send_buf[..]))?;
                     ready!(recv.poll_recv(cx, stream))?;
 
                     let mut payload = recv.payload();
