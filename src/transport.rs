@@ -24,7 +24,7 @@ const CURVE25519_SHA256: &str = "curve25519-sha256@libssh.org";
 const CHACHA20_POLY1305: &str = "chacha20-poly1305@openssh.com";
 
 /// Establish a SSH transport over specified I/O.
-pub async fn establish<T>(stream: &mut T) -> Result<Transport, crate::Error>
+pub async fn establish<T>(mut stream: T) -> Result<Transport<T>, crate::Error>
 where
     T: AsyncBufRead + AsyncWrite + Unpin,
 {
@@ -66,6 +66,7 @@ where
     );
 
     Ok(Transport {
+        stream,
         state: TransportState::Init(vec![]),
         send: SendPacket::default(),
         recv: RecvPacket::default(),
@@ -77,7 +78,8 @@ where
 
 // ==== Transport ====
 
-pub struct Transport {
+pub struct Transport<T> {
+    stream: T,
     state: TransportState,
     send: SendPacket,
     recv: RecvPacket,
@@ -93,15 +95,21 @@ enum TransportState {
     Disconnected,
 }
 
-impl Transport {
-    pub fn poll_handshake<T>(
-        &mut self,
-        cx: &mut task::Context<'_>,
-        stream: &mut T,
-    ) -> Poll<Result<(), crate::Error>>
-    where
-        T: AsyncBufRead + AsyncWrite + Unpin,
-    {
+impl<T> Transport<T>
+where
+    T: AsyncBufRead + AsyncWrite + Unpin,
+{
+    #[inline]
+    pub fn get_ref(&self) -> &T {
+        &self.stream
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self) -> &mut T {
+        &mut self.stream
+    }
+
+    pub fn poll_handshake(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
         let span = tracing::trace_span!("Transport::poll_handshake");
         let _enter = span.enter();
 
@@ -110,7 +118,7 @@ impl Transport {
                 TransportState::Init(ref mut recv_buf) => {
                     tracing::trace!("--> Init");
 
-                    let range = ready!(self.recv.poll_recv(cx, stream, recv_buf))?;
+                    let range = ready!(self.recv.poll_recv(cx, &mut self.stream, recv_buf))?;
 
                     let mut payload = &recv_buf[range];
 
@@ -136,7 +144,7 @@ impl Transport {
 
                 TransportState::Kex => {
                     tracing::trace!("--> Kex");
-                    ready!(self.poll_kex(cx, stream))?;
+                    ready!(self.poll_kex(cx))?;
                 }
 
                 TransportState::Ready => return Poll::Ready(Ok(())),
@@ -149,23 +157,18 @@ impl Transport {
     }
 
     #[inline]
-    pub fn poll_recv<'a, T>(
+    pub fn poll_recv<'a>(
         &mut self,
         cx: &mut task::Context<'_>,
-        stream: &mut T,
         recv_buf: &'a mut Vec<u8>,
-    ) -> Poll<Result<&'a [u8], crate::Error>>
-    where
-        T: AsyncBufRead + AsyncWrite + Unpin,
-    {
-        self.poll_recv_inner(cx, stream, recv_buf)
+    ) -> Poll<Result<&'a [u8], crate::Error>> {
+        self.poll_recv_inner(cx, recv_buf)
             .map_ok(move |range| &recv_buf[range])
     }
 
-    fn poll_recv_inner<T>(
+    fn poll_recv_inner(
         &mut self,
         cx: &mut task::Context<'_>,
-        stream: &mut T,
         recv_buf: &mut Vec<u8>,
     ) -> Poll<Result<Range<usize>, crate::Error>>
     where
@@ -181,7 +184,7 @@ impl Transport {
                 TransportState::Ready => {
                     tracing::trace!("--> Ready");
 
-                    let range = ready!(self.recv.poll_recv(cx, stream, recv_buf))?;
+                    let range = ready!(self.recv.poll_recv(cx, &mut self.stream, recv_buf))?;
                     let mut payload = &recv_buf[range.clone()];
 
                     match peek_u8(&payload) {
@@ -214,7 +217,7 @@ impl Transport {
 
                 TransportState::Kex => {
                     tracing::trace!("--> Kex");
-                    ready!(self.poll_kex(cx, stream))?;
+                    ready!(self.poll_kex(cx))?;
                 }
 
                 TransportState::Disconnected => {
@@ -224,14 +227,10 @@ impl Transport {
         }
     }
 
-    pub fn poll_send_ready<T>(
+    pub fn poll_send_ready(
         &mut self,
         cx: &mut task::Context<'_>,
-        stream: &mut T,
-    ) -> Poll<Result<(), crate::Error>>
-    where
-        T: AsyncBufRead + AsyncWrite + Unpin,
-    {
+    ) -> Poll<Result<(), crate::Error>> {
         let span = tracing::trace_span!("Transport::poll_send");
         let _enter = span.enter();
 
@@ -241,12 +240,12 @@ impl Transport {
 
                 TransportState::Kex => {
                     tracing::trace!("--> Kex");
-                    ready!(self.poll_kex(cx, stream))?;
+                    ready!(self.poll_kex(cx))?;
                 }
 
                 TransportState::Ready => {
                     tracing::trace!("--> Ready");
-                    ready!(self.send.poll_flush(cx, stream))?;
+                    ready!(self.send.poll_flush(cx, &mut self.stream))?;
                     return Poll::Ready(Ok(()));
                 }
 
@@ -282,28 +281,14 @@ impl Transport {
         self.fill(payload.remaining(), |buf| payload.copy_to_slice(buf))
     }
 
-    pub fn poll_flush<T>(
-        &mut self,
-        cx: &mut task::Context<'_>,
-        stream: &mut T,
-    ) -> Poll<Result<(), crate::Error>>
-    where
-        T: AsyncWrite + Unpin,
-    {
+    pub fn poll_flush(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
         let span = tracing::trace_span!("Transport::poll_flush");
         let _enter = span.enter();
 
-        self.send.poll_flush(cx, stream)
+        self.send.poll_flush(cx, &mut self.stream)
     }
 
-    fn poll_kex<T>(
-        &mut self,
-        cx: &mut task::Context<'_>,
-        stream: &mut T,
-    ) -> Poll<Result<(), crate::Error>>
-    where
-        T: AsyncBufRead + AsyncWrite + Unpin,
-    {
+    fn poll_kex(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
         assert!(
             matches!(self.state, TransportState::Kex),
             "unexpected condition"
@@ -311,7 +296,7 @@ impl Transport {
 
         let (opening_key, sealing_key, exchange_hash) = ready!(self.kex.poll_complete(
             cx,
-            stream,
+            &mut self.stream,
             &mut self.send,
             &mut self.recv,
             self.session_id.as_ref(),

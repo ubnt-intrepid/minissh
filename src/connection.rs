@@ -44,13 +44,12 @@ impl Connection {
     pub fn poll_channel_open_session<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-        stream: &mut T,
-        transport: &mut Transport,
+        transport: &mut Transport<T>,
     ) -> Poll<Result<ChannelId, crate::Error>>
     where
         T: AsyncBufRead + AsyncWrite + Unpin,
     {
-        ready!(transport.poll_send_ready(cx, stream))?;
+        ready!(transport.poll_send_ready(cx))?;
 
         let sender_channel = self.allocate_channel();
 
@@ -93,8 +92,7 @@ impl Connection {
     pub fn poll_request_exec<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-        stream: &mut T,
-        transport: &mut Transport,
+        transport: &mut Transport<T>,
         channel: ChannelId,
         command: &str,
     ) -> Poll<Result<(), crate::Error>>
@@ -106,7 +104,7 @@ impl Connection {
             .get_mut(&channel)
             .ok_or_else(|| crate::Error::connection("invalid channel id"))?;
 
-        ready!(transport.poll_send_ready(cx, stream))?;
+        ready!(transport.poll_send_ready(cx))?;
 
         transport.fill(18 + command.len(), |mut buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_REQUEST);
@@ -125,8 +123,7 @@ impl Connection {
     pub fn poll_close<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-        stream: &mut T,
-        transport: &mut Transport,
+        transport: &mut Transport<T>,
         channel: ChannelId,
     ) -> Poll<Result<(), crate::Error>>
     where
@@ -137,7 +134,7 @@ impl Connection {
             None => return Poll::Ready(Ok(())), // do nothing
         };
 
-        ready!(transport.poll_send_ready(cx, stream))?;
+        ready!(transport.poll_send_ready(cx))?;
 
         transport.fill(5, |mut buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_CLOSE);
@@ -152,8 +149,7 @@ impl Connection {
     pub fn poll_window_adjust<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-        stream: &mut T,
-        transport: &mut Transport,
+        transport: &mut Transport<T>,
         channel: ChannelId,
         additional: u32,
     ) -> Poll<Result<(), crate::Error>>
@@ -165,7 +161,7 @@ impl Connection {
             .get_mut(&channel)
             .ok_or_else(|| crate::Error::connection("invalid channel id"))?;
 
-        ready!(transport.poll_send_ready(cx, stream))?;
+        ready!(transport.poll_send_ready(cx))?;
 
         transport.fill(9, |mut buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_WINDOW_ADJUST);
@@ -181,16 +177,15 @@ impl Connection {
     pub fn poll_recv<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-        stream: &mut T,
-        transport: &mut Transport,
+        transport: &mut Transport<T>,
     ) -> Poll<Result<Response, crate::Error>>
     where
         T: AsyncBufRead + AsyncWrite + Unpin,
     {
-        ready!(transport.poll_flush(cx, stream))?;
+        ready!(transport.poll_flush(cx))?;
 
         loop {
-            let mut payload = ready!(transport.poll_recv(cx, stream, &mut self.recv_buf))?;
+            let mut payload = ready!(transport.poll_recv(cx, &mut self.recv_buf))?;
             tracing::trace!("Handle incoming message");
             match payload.get_u8() {
                 // Global request described in https://tools.ietf.org/html/rfc4254#section-4

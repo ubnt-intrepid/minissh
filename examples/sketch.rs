@@ -38,22 +38,17 @@ async fn main() -> Result<()> {
 
     let addr = SocketAddr::from(([192, 168, 122, 10], 22));
 
-    tracing::debug!("connect to SSH server (addr = {})", addr);
+    tracing::debug!("establish SSH transport (addr = {})", addr);
     let stream = TcpStream::connect(&addr).await?;
-    let mut stream = tokio::io::BufReader::new(stream);
-
-    tracing::debug!("establish SSH transport");
-    let mut transport = minissh::transport::establish(&mut stream).await?;
-    poll_fn(|cx| transport.poll_handshake(cx, &mut stream)).await?;
+    let stream = tokio::io::BufReader::new(stream);
+    let mut transport = minissh::transport::establish(stream).await?;
+    poll_fn(|cx| transport.poll_handshake(cx)).await?;
 
     tracing::debug!("userauth");
     let mut userauth = minissh::userauth::Authenticator::default();
-    poll_fn(|cx| {
-        userauth.poll_userauth_password(cx, &mut stream, &mut transport, "devenv", "devenv")
-    })
-    .await?;
+    poll_fn(|cx| userauth.poll_userauth_password(cx, &mut transport, "devenv", "devenv")).await?;
     loop {
-        let res = poll_fn(|cx| userauth.poll_authenticate(cx, &mut stream, &mut transport)).await?;
+        let res = poll_fn(|cx| userauth.poll_authenticate(cx, &mut transport)).await?;
         match res {
             minissh::userauth::AuthResult::Success => break,
             minissh::userauth::AuthResult::Failure { .. } => tracing::error!("auth failed"),
@@ -64,12 +59,11 @@ async fn main() -> Result<()> {
     tracing::debug!("connection");
     let mut conn = minissh::connection::Connection::default();
 
-    let channel =
-        poll_fn(|cx| conn.poll_channel_open_session(cx, &mut stream, &mut transport)).await?;
+    let channel = poll_fn(|cx| conn.poll_channel_open_session(cx, &mut transport)).await?;
     loop {
         use minissh::connection::{ChannelResponse, Response};
 
-        let response = poll_fn(|cx| conn.poll_recv(cx, &mut stream, &mut transport)).await?;
+        let response = poll_fn(|cx| conn.poll_recv(cx, &mut transport)).await?;
         match response {
             Response::Channel(id, ChannelResponse::OpenConfirmation) => {
                 tracing::debug!("open confirmation");
@@ -84,13 +78,12 @@ async fn main() -> Result<()> {
         }
     }
 
-    poll_fn(|cx| conn.poll_request_exec(cx, &mut stream, &mut transport, channel, "pwd")).await?;
-    poll_fn(|cx| conn.poll_window_adjust(cx, &mut stream, &mut transport, channel, 1024 * 8))
-        .await?;
+    poll_fn(|cx| conn.poll_request_exec(cx, &mut transport, channel, "pwd")).await?;
+    poll_fn(|cx| conn.poll_window_adjust(cx, &mut transport, channel, 1024 * 8)).await?;
     loop {
         use minissh::connection::{ChannelResponse, Response};
 
-        let response = poll_fn(|cx| conn.poll_recv(cx, &mut stream, &mut transport)).await?;
+        let response = poll_fn(|cx| conn.poll_recv(cx, &mut transport)).await?;
         match response {
             Response::Channel(_id, ChannelResponse::Data(data)) => {
                 tracing::debug!("data: {:?}", std::str::from_utf8(&*data));
