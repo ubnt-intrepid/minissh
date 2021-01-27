@@ -13,7 +13,7 @@ use futures::{
     ready,
     task::{self, Poll},
 };
-use tokio::io::{AsyncBufRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 pub enum AuthResult {
     Success,
@@ -51,7 +51,7 @@ impl Authenticator {
         transport: &mut Transport<T>,
     ) -> Poll<Result<(), crate::Error>>
     where
-        T: AsyncBufRead + AsyncWrite + Unpin,
+        T: AsyncRead + AsyncWrite + Unpin,
     {
         loop {
             match self.state {
@@ -96,7 +96,7 @@ impl Authenticator {
         transport: &mut Transport<T>,
     ) -> Poll<Result<(), crate::Error>>
     where
-        T: AsyncBufRead + AsyncWrite + Unpin,
+        T: AsyncRead + AsyncWrite + Unpin,
     {
         ready!(self.poll_service_request(cx, transport))?;
         ready!(transport.poll_send_ready(cx))?;
@@ -112,7 +112,7 @@ impl Authenticator {
         fill_fields: F,
     ) -> Result<(), crate::Error>
     where
-        T: AsyncBufRead + AsyncWrite + Unpin,
+        T: AsyncRead + AsyncWrite + Unpin,
         F: FnOnce(&mut [u8]),
     {
         let payload_length = 27 + username.len() + method_name.len() + fields_len;
@@ -136,7 +136,7 @@ impl Authenticator {
         password: &str,
     ) -> Poll<Result<(), crate::Error>>
     where
-        T: AsyncBufRead + AsyncWrite + Unpin,
+        T: AsyncRead + AsyncWrite + Unpin,
     {
         ready!(self.poll_send_userauth_ready(cx, transport))?;
 
@@ -156,7 +156,7 @@ impl Authenticator {
         transport: &mut Transport<T>,
     ) -> Poll<Result<AuthResult, crate::Error>>
     where
-        T: AsyncBufRead + AsyncWrite + Unpin,
+        T: AsyncRead + AsyncWrite + Unpin,
     {
         loop {
             match self.state {

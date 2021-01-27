@@ -40,8 +40,7 @@ async fn main() -> Result<()> {
 
     tracing::debug!("establish SSH transport (addr = {})", addr);
     let stream = TcpStream::connect(&addr).await?;
-    let stream = tokio::io::BufReader::new(stream);
-    let mut transport = minissh::transport::establish(stream).await?;
+    let mut transport = minissh::transport::Transport::new(stream);
     poll_fn(|cx| transport.poll_handshake(cx)).await?;
 
     tracing::debug!("userauth");

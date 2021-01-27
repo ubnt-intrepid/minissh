@@ -8,14 +8,15 @@ use crate::{
     consts,
     util::{get_ssh_string, peek_u8, put_ssh_string},
 };
-use bytes::{buf::UninitSlice, Buf, BufMut};
+use bytes::{buf::UninitSlice, Buf, BufMut, Bytes, BytesMut};
 use futures::{
     ready,
     task::{self, Poll},
 };
+use pin_project_lite::pin_project;
 use ring::{aead::chacha20_poly1305_openssh as aead, agreement, digest, rand, signature};
-use std::{convert::TryInto as _, io, num, ops::Range, pin::Pin};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
+use std::{cmp, convert::TryInto as _, io, mem::MaybeUninit, num, ops::Range, pin::Pin};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 // defined in https://git.libssh.org/projects/libssh.git/tree/doc/curve25519-sha256@libssh.org.txt#n62
 const CURVE25519_SHA256: &str = "curve25519-sha256@libssh.org";
@@ -23,58 +24,7 @@ const CURVE25519_SHA256: &str = "curve25519-sha256@libssh.org";
 // defined in http://cvsweb.openbsd.org/cgi-bin/cvsweb/src/usr.bin/ssh/PROTOCOL.chacha20poly1305?rev=1.5&content-type=text/x-cvsweb-markup
 const CHACHA20_POLY1305: &str = "chacha20-poly1305@openssh.com";
 
-/// Establish a SSH transport over specified I/O.
-pub async fn establish<T>(mut stream: T) -> Result<Transport<T>, crate::Error>
-where
-    T: AsyncBufRead + AsyncWrite + Unpin,
-{
-    tracing::debug!("Exchange SSH identifiers");
-    let client_id = concat!("SSH-2.0-minissh_", env!("CARGO_PKG_VERSION"))
-        .as_bytes()
-        .to_owned();
-    {
-        let mut buf = Buf::chain(&client_id[..], &b"\r\n"[..]);
-        while buf.has_remaining() {
-            stream.write_buf(&mut buf).await.map_err(crate::Error::io)?;
-        }
-        stream.flush().await.map_err(crate::Error::io)?;
-    }
-
-    let server_id = {
-        let mut line = vec![];
-        loop {
-            let _amt = stream
-                .read_until(b'\n', &mut line)
-                .await
-                .map_err(crate::Error::io)?;
-            if line.starts_with(b"SSH-") {
-                break;
-            }
-            line.clear();
-        }
-        let n = line
-            .iter()
-            .take_while(|&&c| c != b'\r' && c != b'\n')
-            .count();
-        line.resize(n, 0);
-        line
-    };
-    tracing::debug!(
-        "--> client_id={:?}, server_id={:?}",
-        String::from_utf8_lossy(&client_id),
-        String::from_utf8_lossy(&server_id)
-    );
-
-    Ok(Transport {
-        stream,
-        state: TransportState::Init(vec![]),
-        send: SendPacket::default(),
-        recv: RecvPacket::default(),
-        kex: KeyExchange::new(client_id, server_id),
-        session_id: None,
-        rng: rand::SystemRandom::new(),
-    })
-}
+const CLIENT_SSH_ID: &[u8] = concat!("SSH-2.0-minissh_", env!("CARGO_PKG_VERSION")).as_bytes();
 
 // ==== Transport ====
 
@@ -89,7 +39,19 @@ pub struct Transport<T> {
 }
 
 enum TransportState {
-    Init(Vec<u8>),
+    Init,
+    WriteClientSshId {
+        line: Vec<u8>,
+        written: usize,
+    },
+    FlushClientSshId,
+    ReadServerSshId {
+        buf: BytesMut,
+    },
+    WaitingServerKexInit {
+        recv_buf: Vec<u8>,
+        remains: Option<Bytes>,
+    },
     Kex,
     Ready,
     Disconnected,
@@ -97,8 +59,20 @@ enum TransportState {
 
 impl<T> Transport<T>
 where
-    T: AsyncBufRead + AsyncWrite + Unpin,
+    T: AsyncRead + AsyncWrite + Unpin,
 {
+    pub fn new(stream: T) -> Self {
+        Self {
+            stream,
+            state: TransportState::Init,
+            send: SendPacket::default(),
+            recv: RecvPacket::default(),
+            kex: KeyExchange::default(),
+            session_id: None,
+            rng: rand::SystemRandom::new(),
+        }
+    }
+
     #[inline]
     pub fn get_ref(&self) -> &T {
         &self.stream
@@ -115,10 +89,122 @@ where
 
         loop {
             match self.state {
-                TransportState::Init(ref mut recv_buf) => {
+                TransportState::Init => {
                     tracing::trace!("--> Init");
+                    self.state = TransportState::WriteClientSshId {
+                        line: {
+                            let mut line = CLIENT_SSH_ID.to_owned();
+                            line.put_slice(b"\r\n");
+                            line
+                        },
+                        written: 0,
+                    };
+                }
 
-                    let range = ready!(self.recv.poll_recv(cx, &mut self.stream, recv_buf))?;
+                TransportState::WriteClientSshId {
+                    ref line,
+                    ref mut written,
+                } => {
+                    tracing::trace!("--> WriteClientSshId(written = {})", written);
+
+                    let mut stream = Pin::new(&mut self.stream);
+
+                    let mut buf = &line[*written..];
+                    while buf.has_remaining() {
+                        let amt = ready!(stream.as_mut().poll_write(cx, buf))
+                            .map_err(crate::Error::io)?;
+                        buf.advance(amt);
+                        *written += amt;
+                    }
+
+                    self.state = TransportState::FlushClientSshId;
+                }
+
+                TransportState::FlushClientSshId => {
+                    tracing::trace!("--> FlushClientSshId");
+
+                    let mut stream = Pin::new(&mut self.stream);
+                    ready!(stream.as_mut().poll_flush(cx)).map_err(crate::Error::io)?;
+
+                    self.state = TransportState::ReadServerSshId {
+                        buf: BytesMut::with_capacity(256), // TODO: choose appropriate buffer size
+                    };
+                }
+
+                TransportState::ReadServerSshId { ref mut buf } => {
+                    tracing::trace!(
+                        "--> ReadServerSshId(buf = {:?})",
+                        String::from_utf8_lossy(&buf)
+                    );
+
+                    let mut stream = Pin::new(&mut self.stream);
+
+                    unsafe {
+                        let mut read_buf = ReadBuf::uninit(std::slice::from_raw_parts_mut(
+                            buf.as_mut_ptr() as *mut MaybeUninit<u8>,
+                            buf.capacity(),
+                        ));
+                        read_buf.assume_init(buf.len());
+                        read_buf.set_filled(buf.len());
+
+                        let rem = read_buf.remaining();
+                        ready!(stream.as_mut().poll_read(cx, &mut read_buf))
+                            .map_err(crate::Error::io)?;
+                        if rem == read_buf.remaining() {
+                            return Poll::Ready(Err(crate::Error::io(eof("recv server SSH id"))));
+                        }
+
+                        buf.set_len(read_buf.filled().len());
+                    }
+
+                    let (server_id, remains) = match buf.iter().position(|&b| b == b'\n') {
+                        Some(pos) => {
+                            let mut line = buf.split_to(pos + 1); // including \n
+                            if !line.starts_with(b"SSH-") {
+                                // ignore banner text.
+                                continue;
+                            }
+
+                            let buf = std::mem::take(buf);
+
+                            let n = line
+                                .iter()
+                                .take_while(|&&c| c != b'\r' && c != b'\n')
+                                .count();
+                            line.truncate(n);
+
+                            (line.freeze(), buf.freeze())
+                        }
+                        None => {
+                            // continue reading line.
+                            continue;
+                        }
+                    };
+
+                    tracing::trace!("--> server_id = {:?}", String::from_utf8_lossy(&server_id));
+
+                    self.kex.server_id = server_id.to_vec();
+                    self.state = TransportState::WaitingServerKexInit {
+                        recv_buf: vec![],
+                        remains: Some(remains),
+                    };
+                }
+
+                TransportState::WaitingServerKexInit {
+                    ref mut recv_buf,
+                    ref mut remains,
+                } => {
+                    tracing::trace!("--> WaitingServerKexInit");
+
+                    let range = ready!(self.recv.poll_recv(
+                        cx,
+                        &mut Rewind {
+                            stream: &mut self.stream,
+                            remains,
+                        },
+                        recv_buf
+                    ))?;
+                    debug_assert!(remains.as_ref().map_or(true, |buf| buf.is_empty()));
 
                     let mut payload = &recv_buf[range];
 
@@ -170,16 +256,19 @@ where
         &mut self,
         cx: &mut task::Context<'_>,
         recv_buf: &mut Vec<u8>,
-    ) -> Poll<Result<Range<usize>, crate::Error>>
-    where
-        T: AsyncBufRead + AsyncWrite + Unpin,
-    {
+    ) -> Poll<Result<Range<usize>, crate::Error>> {
         let span = tracing::trace_span!("Transport::poll_recv");
         let _enter = span.enter();
 
         loop {
             match self.state {
-                TransportState::Init(..) => panic!("called before poll_handshake() completed"),
+                TransportState::Init
+                | TransportState::WriteClientSshId { .. }
+                | TransportState::FlushClientSshId
+                | TransportState::ReadServerSshId { .. }
+                | TransportState::WaitingServerKexInit { .. } => {
+                    panic!("called before poll_handshake() completed")
+                }
 
                 TransportState::Ready => {
                     tracing::trace!("--> Ready");
@@ -236,7 +325,13 @@ where
 
         loop {
             match self.state {
-                TransportState::Init(..) => panic!("called before poll_handshake() completed"),
+                TransportState::Init
+                | TransportState::WriteClientSshId { .. }
+                | TransportState::FlushClientSshId
+                | TransportState::ReadServerSshId { .. }
+                | TransportState::WaitingServerKexInit { .. } => {
+                    panic!("called before poll_handshake() completed")
+                }
 
                 TransportState::Kex => {
                     tracing::trace!("--> Kex");
@@ -315,6 +410,43 @@ where
 
     pub(crate) fn session_id(&self) -> &digest::Digest {
         self.session_id.as_ref().unwrap()
+    }
+}
+
+pin_project! {
+    struct Rewind<'a, T> {
+        #[pin]
+        stream: T,
+        remains: &'a mut Option<Bytes>,
+    }
+}
+
+impl<T> AsyncRead for Rewind<'_, T>
+where
+    T: AsyncRead,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let me = self.project();
+
+        if let Some(ref mut remains) = me.remains {
+            if !remains.is_empty() {
+                let amt = cmp::min(remains.len(), buf.remaining());
+                buf.put_slice(&remains[..amt]);
+                remains.advance(amt);
+
+                if remains.is_empty() {
+                    me.remains.take();
+                }
+
+                return Poll::Ready(Ok(()));
+            }
+        }
+
+        me.stream.poll_read(cx, buf)
     }
 }
 
@@ -465,7 +597,7 @@ impl RecvPacket {
         buf: &mut Vec<u8>,
     ) -> Poll<Result<Range<usize>, crate::Error>>
     where
-        T: AsyncBufRead + Unpin,
+        T: AsyncRead + Unpin,
     {
         let span = tracing::trace_span!("RecvPacket::poll_recv");
         let _enter = span.enter();
@@ -548,7 +680,6 @@ impl RecvPacket {
 // ==== KeyExchange ====
 
 struct KeyExchange {
-    client_id: Vec<u8>,
     server_id: Vec<u8>,
     client_kexinit_payload: Vec<u8>,
     client_ephemeral_key: Option<(agreement::EphemeralPrivateKey, agreement::PublicKey)>,
@@ -568,11 +699,10 @@ enum KeyExchangeState {
     Exchanged,
 }
 
-impl KeyExchange {
-    fn new(client_id: Vec<u8>, server_id: Vec<u8>) -> Self {
+impl Default for KeyExchange {
+    fn default() -> Self {
         Self {
-            client_id,
-            server_id,
+            server_id: vec![],
             client_kexinit_payload: vec![],
             client_ephemeral_key: None,
             digest: None,
@@ -581,7 +711,9 @@ impl KeyExchange {
             recv_buf: vec![],
         }
     }
+}
 
+impl KeyExchange {
     fn start<B>(
         &mut self,
         server_kexinit_payload: &mut B,
@@ -599,7 +731,7 @@ impl KeyExchange {
         }
 
         let mut digest = digest::Context::new(&digest::SHA256);
-        digest_ssh_string(&mut digest, &self.client_id[..]);
+        digest_ssh_string(&mut digest, &CLIENT_SSH_ID[..]);
         digest_ssh_string(&mut digest, &self.server_id[..]);
 
         // set client kexinit.
@@ -643,7 +775,7 @@ impl KeyExchange {
         session_id: Option<&digest::Digest>,
     ) -> Poll<Result<(aead::OpeningKey, aead::SealingKey, digest::Digest), crate::Error>>
     where
-        T: AsyncBufRead + AsyncWrite + Unpin,
+        T: AsyncRead + AsyncWrite + Unpin,
     {
         let span = tracing::trace_span!("KeyExchange::poll_complete_kex");
         let _enter = span.enter();

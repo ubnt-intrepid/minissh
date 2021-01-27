@@ -9,7 +9,7 @@ use futures::{
     task::{self, Poll},
 };
 use std::{cmp, collections::HashMap, num};
-use tokio::io::{AsyncBufRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 pub struct Connection {
     initial_window_size: u32,
@@ -47,7 +47,7 @@ impl Connection {
         transport: &mut Transport<T>,
     ) -> Poll<Result<ChannelId, crate::Error>>
     where
-        T: AsyncBufRead + AsyncWrite + Unpin,
+        T: AsyncRead + AsyncWrite + Unpin,
     {
         ready!(transport.poll_send_ready(cx))?;
 
@@ -97,7 +97,7 @@ impl Connection {
         command: &str,
     ) -> Poll<Result<(), crate::Error>>
     where
-        T: AsyncBufRead + AsyncWrite + Unpin,
+        T: AsyncRead + AsyncWrite + Unpin,
     {
         let channel = self
             .channels
@@ -127,7 +127,7 @@ impl Connection {
         channel: ChannelId,
     ) -> Poll<Result<(), crate::Error>>
     where
-        T: AsyncBufRead + AsyncWrite + Unpin,
+        T: AsyncRead + AsyncWrite + Unpin,
     {
         let channel = match self.channels.get_mut(&channel) {
             Some(ch) => ch,
@@ -154,7 +154,7 @@ impl Connection {
         additional: u32,
     ) -> Poll<Result<(), crate::Error>>
     where
-        T: AsyncBufRead + AsyncWrite + Unpin,
+        T: AsyncRead + AsyncWrite + Unpin,
     {
         let channel = self
             .channels
@@ -180,7 +180,7 @@ impl Connection {
         transport: &mut Transport<T>,
     ) -> Poll<Result<Response, crate::Error>>
     where
-        T: AsyncBufRead + AsyncWrite + Unpin,
+        T: AsyncRead + AsyncWrite + Unpin,
     {
         ready!(transport.poll_flush(cx))?;
 
