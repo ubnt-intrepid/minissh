@@ -16,7 +16,7 @@ pub struct Connection {
     maximum_packet_size: u32,
     channels: HashMap<ChannelId, Channel>,
     next_channel_id: num::Wrapping<u32>,
-    recv_buf: Vec<u8>,
+    recv_buf: Box<[u8]>,
 }
 
 impl Default for Connection {
@@ -26,7 +26,7 @@ impl Default for Connection {
             maximum_packet_size: 0x8000,
             channels: HashMap::new(),
             next_channel_id: num::Wrapping(0),
-            recv_buf: vec![],
+            recv_buf: vec![0u8; 0x10000].into_boxed_slice(),
         }
     }
 }

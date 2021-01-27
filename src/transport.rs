@@ -49,7 +49,7 @@ enum TransportState {
         buf: BytesMut,
     },
     WaitingServerKexInit {
-        recv_buf: Vec<u8>,
+        recv_buf: Box<[u8]>,
         remains: Option<Bytes>,
     },
     Kex,
@@ -185,7 +185,7 @@ where
 
                     self.kex.server_id = server_id.to_vec();
                     self.state = TransportState::WaitingServerKexInit {
-                        recv_buf: vec![],
+                        recv_buf: vec![0u8; 0x10000].into_boxed_slice(),
                         remains: Some(remains),
                     };
                 }
@@ -246,7 +246,7 @@ where
     pub fn poll_recv<'a>(
         &mut self,
         cx: &mut task::Context<'_>,
-        recv_buf: &'a mut Vec<u8>,
+        recv_buf: &'a mut [u8],
     ) -> Poll<Result<&'a [u8], crate::Error>> {
         self.poll_recv_inner(cx, recv_buf)
             .map_ok(move |range| &recv_buf[range])
@@ -255,7 +255,7 @@ where
     fn poll_recv_inner(
         &mut self,
         cx: &mut task::Context<'_>,
-        recv_buf: &mut Vec<u8>,
+        recv_buf: &mut [u8],
     ) -> Poll<Result<Range<usize>, crate::Error>> {
         let span = tracing::trace_span!("Transport::poll_recv");
         let _enter = span.enter();
@@ -565,7 +565,6 @@ impl SendPacket {
 // ==== RecvPacket ====
 
 struct RecvPacket {
-    packet_length: u32,
     state: RecvPacketState,
     seqn: num::Wrapping<u32>,
     key: OpeningKey,
@@ -573,14 +572,19 @@ struct RecvPacket {
 
 enum RecvPacketState {
     Ready,
-    ReadingLength(usize),
-    ReadingPacket(usize),
+    ReadingLength {
+        filled: usize,
+    },
+    ReadingPacket {
+        packet_length: u32,
+        buf_len: usize,
+        filled: usize,
+    },
 }
 
 impl Default for RecvPacket {
     fn default() -> Self {
         Self {
-            packet_length: 0,
             state: RecvPacketState::Ready,
             seqn: num::Wrapping(0),
             key: OpeningKey::ClearText,
@@ -594,7 +598,7 @@ impl RecvPacket {
         &mut self,
         cx: &mut task::Context<'_>,
         stream: &mut T,
-        buf: &mut Vec<u8>,
+        buf: &mut [u8],
     ) -> Poll<Result<Range<usize>, crate::Error>>
     where
         T: AsyncRead + Unpin,
@@ -607,70 +611,97 @@ impl RecvPacket {
             match self.state {
                 RecvPacketState::Ready => {
                     tracing::trace!("--> Ready");
-                    unsafe {
-                        // zeroing previous cleartext.
-                        std::ptr::write_bytes(buf.as_mut_ptr(), 0, buf.len());
-                    }
-                    buf.resize(4, 0u8);
-                    self.state = RecvPacketState::ReadingLength(0);
+                    self.state = RecvPacketState::ReadingLength { filled: 0 };
                 }
 
-                RecvPacketState::ReadingLength(ref mut read) => {
-                    tracing::trace!("--> ReadingLength({})", read);
+                RecvPacketState::ReadingLength { ref mut filled } => {
+                    tracing::trace!("--> ReadingLength(filled = {})", filled);
 
-                    let mut read_buf = ReadBuf::new(&mut buf[..4]);
-                    read_buf.set_filled(*read);
+                    let mut read_buf = ReadBuf::new(&mut buf[..aead::PACKET_LENGTH_LEN]);
+                    read_buf.set_filled(*filled);
 
                     loop {
                         let rem = read_buf.remaining();
-                        if rem != 0 {
-                            ready!(stream.as_mut().poll_read(cx, &mut read_buf))
-                                .map_err(crate::Error::io)?;
-                            if read_buf.remaining() == rem {
-                                return Poll::Ready(Err(crate::Error::io(eof(
-                                    "unexpected eof during reading packet length",
-                                ))));
-                            }
-                            *read = read_buf.filled().len();
-                        } else {
+                        if rem == 0 {
                             break;
+                        }
+
+                        ready!(stream.as_mut().poll_read(cx, &mut read_buf))
+                            .map_err(crate::Error::io)?;
+                        *filled = read_buf.filled().len();
+
+                        if read_buf.remaining() == rem {
+                            return Poll::Ready(Err(crate::Error::io(eof(
+                                "unexpected eof during reading packet length",
+                            ))));
                         }
                     }
 
-                    let encrypted_packet_length = &buf[..4];
-                    let packet_length = self
-                        .key
-                        .decrypt_packet_length(self.seqn.0, encrypted_packet_length);
+                    let encrypted_packet_length = &buf[..aead::PACKET_LENGTH_LEN] //
+                        .try_into()
+                        .expect("packet length is too short");
+                    let packet_length = u32::from_be_bytes(
+                        self.key
+                            .decrypt_packet_length(self.seqn.0, *encrypted_packet_length),
+                    );
                     tracing::trace!("packet_lenghth = {}", packet_length);
 
-                    self.packet_length = packet_length;
-                    buf.resize(4 + packet_length as usize + self.key.tag_len(), 0);
-                    self.state = RecvPacketState::ReadingPacket(4);
+                    let buf_len =
+                        aead::PACKET_LENGTH_LEN + packet_length as usize + self.key.tag_len();
+                    assert!(buf.len() >= buf_len, "provided buffer is too short");
+
+                    self.state = RecvPacketState::ReadingPacket {
+                        packet_length,
+                        buf_len,
+                        filled: aead::PACKET_LENGTH_LEN,
+                    };
                 }
 
-                RecvPacketState::ReadingPacket(ref mut read) => {
-                    tracing::trace!("--> ReadingPacket({})", read);
+                RecvPacketState::ReadingPacket {
+                    packet_length,
+                    buf_len,
+                    ref mut filled,
+                } => {
+                    tracing::trace!("--> ReadingPacket(filled = {})", filled);
 
-                    let mut read_buf = ReadBuf::new(&mut buf[..]);
-                    read_buf.set_filled(*read);
+                    let buf = &mut buf[..buf_len];
 
-                    while read_buf.remaining() > 0 {
-                        ready!(stream.as_mut().poll_read(cx, &mut read_buf))
-                            .map_err(crate::Error::io)?;
-                        *read = read_buf.filled().len();
+                    {
+                        let mut read_buf = ReadBuf::new(buf);
+                        read_buf.set_filled(*filled);
+
+                        loop {
+                            let rem = read_buf.remaining();
+                            if rem == 0 {
+                                break;
+                            }
+
+                            ready!(stream.as_mut().poll_read(cx, &mut read_buf))
+                                .map_err(crate::Error::io)?;
+                            *filled = read_buf.filled().len();
+
+                            if read_buf.remaining() == rem {
+                                return Poll::Ready(Err(crate::Error::io(eof(
+                                    "unexpected eof during reading packet",
+                                ))));
+                            }
+                        }
                     }
 
-                    let (ciphertext, tag) = buf.split_at_mut(4 + self.packet_length as usize);
+                    let (ciphertext, tag) =
+                        buf.split_at_mut(aead::PACKET_LENGTH_LEN + packet_length as usize);
                     debug_assert_eq!(tag.len(), self.key.tag_len());
                     self.key.open_in_place(self.seqn.0, ciphertext, tag)?;
 
                     self.seqn += num::Wrapping(1);
                     self.state = RecvPacketState::Ready;
 
-                    let padding_length = buf[4];
-                    let payload_length = self.packet_length as usize - padding_length as usize - 1;
+                    let padding_length = buf[aead::PACKET_LENGTH_LEN];
+                    let payload_length = packet_length as usize - padding_length as usize - 1;
 
-                    return Poll::Ready(Ok(5..5 + payload_length));
+                    return Poll::Ready(Ok(
+                        aead::PACKET_LENGTH_LEN + 1..aead::PACKET_LENGTH_LEN + 1 + payload_length
+                    ));
                 }
             }
         }
@@ -686,7 +717,7 @@ struct KeyExchange {
     digest: Option<digest::Context>,
     state: KeyExchangeState,
     output: Option<(aead::OpeningKey, aead::SealingKey, digest::Digest)>,
-    recv_buf: Vec<u8>,
+    recv_buf: Box<[u8]>,
 }
 
 enum KeyExchangeState {
@@ -708,7 +739,7 @@ impl Default for KeyExchange {
             digest: None,
             state: KeyExchangeState::Init,
             output: None,
-            recv_buf: vec![],
+            recv_buf: vec![0u8; 0x10000].into_boxed_slice(),
         }
     }
 }
@@ -808,12 +839,12 @@ impl KeyExchange {
                     tracing::trace!("--> ReceivingEcdhReply");
 
                     ready!(send.poll_flush(cx, stream))?;
+
                     let range = ready!(recv.poll_recv(cx, stream, &mut self.recv_buf))?;
+                    let mut payload = &self.recv_buf[range];
 
                     let mut digest = self.digest.take().unwrap();
                     let client_public_key = self.client_public_key();
-
-                    let mut payload = &self.recv_buf[range];
 
                     if payload.get_u8() != consts::SSH_MSG_KEX_ECDH_REPLY {
                         return Poll::Ready(Err(crate::Error::transport(
@@ -943,8 +974,8 @@ impl KeyExchange {
                     tracing::trace!("--> ReceivingServerNewKeys");
 
                     ready!(send.poll_flush(cx, stream))?;
-                    let range = ready!(recv.poll_recv(cx, stream, &mut self.recv_buf))?;
 
+                    let range = ready!(recv.poll_recv(cx, stream, &mut self.recv_buf))?;
                     let mut payload = &self.recv_buf[range];
 
                     if payload.get_u8() != consts::SSH_MSG_NEWKEYS {
@@ -1001,20 +1032,15 @@ enum OpeningKey {
 }
 impl OpeningKey {
     #[inline]
-    fn decrypt_packet_length(&self, seqn: u32, encrypted_packet_length: &[u8]) -> u32 {
+    fn decrypt_packet_length(
+        &self,
+        seqn: u32,
+        encrypted_packet_length: [u8; aead::PACKET_LENGTH_LEN],
+    ) -> [u8; aead::PACKET_LENGTH_LEN] {
         match self {
-            OpeningKey::ClearText => u32::from_be_bytes(
-                encrypted_packet_length
-                    .try_into()
-                    .expect("encrypted_packet_length is too short"),
-            ),
+            OpeningKey::ClearText => encrypted_packet_length,
             OpeningKey::Chacha20Poly1305(ref key) => {
-                let encrypted_packet_length: [u8; aead::PACKET_LENGTH_LEN] =
-                    encrypted_packet_length
-                        .try_into()
-                        .expect("packet length is too short");
-                let decrypted = key.decrypt_packet_length(seqn, encrypted_packet_length);
-                u32::from_be_bytes(decrypted)
+                key.decrypt_packet_length(seqn, encrypted_packet_length)
             }
         }
     }

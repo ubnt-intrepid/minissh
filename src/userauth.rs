@@ -25,7 +25,7 @@ pub enum AuthResult {
 
 pub struct Authenticator {
     state: AuthState,
-    recv_buf: Vec<u8>,
+    recv_buf: Box<[u8]>,
 }
 
 enum AuthState {
@@ -39,7 +39,7 @@ impl Default for Authenticator {
     fn default() -> Self {
         Self {
             state: AuthState::Init,
-            recv_buf: vec![],
+            recv_buf: vec![0u8; 0x10000].into_boxed_slice(),
         }
     }
 }
