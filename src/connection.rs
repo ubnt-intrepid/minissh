@@ -53,13 +53,13 @@ impl Connection {
 
         let sender_channel = self.allocate_channel();
 
-        transport.fill(24, |mut buf| {
+        transport.fill_buf(|mut buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_OPEN);
             put_ssh_string(&mut buf, b"session");
             buf.put_u32(sender_channel.0);
             buf.put_u32(self.initial_window_size);
             buf.put_u32(self.maximum_packet_size);
-            debug_assert!(buf.is_empty());
+            24
         })?;
 
         Poll::Ready(Ok(sender_channel))
@@ -106,13 +106,13 @@ impl Connection {
 
         ready!(transport.poll_send_ready(cx))?;
 
-        transport.fill(18 + command.len(), |mut buf| {
+        transport.fill_buf(|mut buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_REQUEST);
             buf.put_u32(channel.recipient_id.0);
             put_ssh_string(&mut buf, b"exec");
             buf.put_u8(0); // want_reply=FALSE
             put_ssh_string(&mut buf, command.as_ref());
-            debug_assert!(buf.is_empty());
+            18 + command.len()
         })?;
 
         // TODO: mark send state.
@@ -136,9 +136,10 @@ impl Connection {
 
         ready!(transport.poll_send_ready(cx))?;
 
-        transport.fill(5, |mut buf| {
+        transport.fill_buf(|mut buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_CLOSE);
             buf.put_u32(channel.recipient_id.0);
+            5
         })?;
 
         channel.state = ChannelState::Closing;
@@ -163,10 +164,11 @@ impl Connection {
 
         ready!(transport.poll_send_ready(cx))?;
 
-        transport.fill(9, |mut buf| {
+        transport.fill_buf(|mut buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_WINDOW_ADJUST);
             buf.put_u32(channel.recipient_id.0);
             buf.put_u32(additional);
+            9
         })?;
 
         channel.recipient_window_size = channel.recipient_window_size.saturating_add(additional);

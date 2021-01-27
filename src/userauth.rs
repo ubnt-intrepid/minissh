@@ -59,7 +59,10 @@ impl Authenticator {
                     const PAYLOAD: &[u8] = b"\x05\x00\x00\x00\x0Cssh-userauth";
 
                     ready!(transport.poll_send_ready(cx))?;
-                    transport.fill_buf(&mut &PAYLOAD[..])?;
+                    transport.fill_buf(|mut buf| {
+                        buf.put_slice(PAYLOAD);
+                        PAYLOAD.len()
+                    })?;
 
                     ready!(transport.poll_flush(cx))?;
 
@@ -115,13 +118,13 @@ impl Authenticator {
         T: AsyncRead + AsyncWrite + Unpin,
         F: FnOnce(&mut [u8]),
     {
-        let payload_length = 27 + username.len() + method_name.len() + fields_len;
-        transport.fill(payload_length, |mut buf| {
+        transport.fill_buf(|mut buf| {
             buf.put_u8(consts::SSH_MSG_USERAUTH_REQUEST);
             put_ssh_string(&mut buf, username.as_ref());
             put_ssh_string(&mut buf, b"ssh-connection"); // service name
             put_ssh_string(&mut buf, method_name.as_ref()); // method name
             fill_fields(buf);
+            27 + username.len() + method_name.len() + fields_len
         })?;
 
         Ok(())
