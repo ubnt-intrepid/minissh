@@ -1,5 +1,5 @@
 use anyhow::Result;
-use futures::future::poll_fn;
+use futures::{future::poll_fn, ready};
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
 
@@ -45,7 +45,16 @@ async fn main() -> Result<()> {
 
     tracing::debug!("userauth");
     let mut userauth = minissh::userauth::Authenticator::default();
-    poll_fn(|cx| userauth.poll_userauth_password(cx, &mut transport, "devenv", "devenv")).await?;
+    poll_fn(|cx| userauth.poll_service_request(cx, &mut transport)).await?;
+
+    poll_fn(|cx| {
+        ready!(transport.poll_ready(cx))?;
+        userauth
+            .userauth_password(&mut transport, "devenv", "devenv")
+            .into()
+    })
+    .await?;
+
     loop {
         let res = poll_fn(|cx| userauth.poll_authenticate(cx, &mut transport)).await?;
         match res {
@@ -58,7 +67,7 @@ async fn main() -> Result<()> {
     tracing::debug!("connection");
     let mut conn = minissh::connection::Connection::default();
 
-    let channel = poll_fn(|cx| conn.poll_channel_open_session(cx, &mut transport)).await?;
+    let channel = conn.channel_open_session(&mut transport)?;
     loop {
         use minissh::connection::{ChannelResponse, Response};
 
@@ -77,8 +86,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    poll_fn(|cx| conn.poll_request_exec(cx, &mut transport, channel, "pwd")).await?;
-    poll_fn(|cx| conn.poll_window_adjust(cx, &mut transport, channel, 1024 * 8)).await?;
+    poll_fn(|cx| transport.poll_flush(cx)).await?;
+    conn.channel_request_exec(&mut transport, channel, "pwd")?;
+    conn.window_adjust(&mut transport, channel, 1024 * 8)?;
     loop {
         use minissh::connection::{ChannelResponse, Response};
 

@@ -41,16 +41,13 @@ impl Connection {
     }
 
     /// Request to open a session channel.
-    pub fn poll_channel_open_session<T>(
+    pub fn channel_open_session<T>(
         &mut self,
-        cx: &mut task::Context<'_>,
         transport: &mut Transport<T>,
-    ) -> Poll<Result<ChannelId, crate::Error>>
+    ) -> Result<ChannelId, crate::Error>
     where
         T: AsyncRead + AsyncWrite + Unpin,
     {
-        ready!(transport.poll_send_ready(cx))?;
-
         let sender_channel = self.allocate_channel();
 
         transport.fill_buf(|mut buf| {
@@ -59,10 +56,9 @@ impl Connection {
             buf.put_u32(sender_channel.0);
             buf.put_u32(self.initial_window_size);
             buf.put_u32(self.maximum_packet_size);
-            24
         })?;
 
-        Poll::Ready(Ok(sender_channel))
+        Ok(sender_channel)
     }
 
     fn allocate_channel(&mut self) -> ChannelId {
@@ -89,13 +85,12 @@ impl Connection {
         }
     }
 
-    pub fn poll_request_exec<T>(
+    pub fn channel_request_exec<T>(
         &mut self,
-        cx: &mut task::Context<'_>,
         transport: &mut Transport<T>,
         channel: ChannelId,
         command: &str,
-    ) -> Poll<Result<(), crate::Error>>
+    ) -> Result<(), crate::Error>
     where
         T: AsyncRead + AsyncWrite + Unpin,
     {
@@ -103,8 +98,6 @@ impl Connection {
             .channels
             .get_mut(&channel)
             .ok_or_else(|| crate::Error::connection("invalid channel id"))?;
-
-        ready!(transport.poll_send_ready(cx))?;
 
         transport.fill_buf(|mut buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_REQUEST);
@@ -112,48 +105,42 @@ impl Connection {
             put_ssh_string(&mut buf, b"exec");
             buf.put_u8(0); // want_reply=FALSE
             put_ssh_string(&mut buf, command.as_ref());
-            18 + command.len()
         })?;
 
         // TODO: mark send state.
 
-        Poll::Ready(Ok(()))
+        Ok(())
     }
 
-    pub fn poll_close<T>(
+    pub fn channel_close<T>(
         &mut self,
-        cx: &mut task::Context<'_>,
         transport: &mut Transport<T>,
         channel: ChannelId,
-    ) -> Poll<Result<(), crate::Error>>
+    ) -> Result<(), crate::Error>
     where
         T: AsyncRead + AsyncWrite + Unpin,
     {
         let channel = match self.channels.get_mut(&channel) {
             Some(ch) => ch,
-            None => return Poll::Ready(Ok(())), // do nothing
+            None => return Ok(()), // do nothing
         };
 
-        ready!(transport.poll_send_ready(cx))?;
-
-        transport.fill_buf(|mut buf| {
+        transport.fill_buf(|buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_CLOSE);
             buf.put_u32(channel.recipient_id.0);
-            5
         })?;
 
         channel.state = ChannelState::Closing;
 
-        Poll::Ready(Ok(()))
+        Ok(())
     }
 
-    pub fn poll_window_adjust<T>(
+    pub fn window_adjust<T>(
         &mut self,
-        cx: &mut task::Context<'_>,
         transport: &mut Transport<T>,
         channel: ChannelId,
         additional: u32,
-    ) -> Poll<Result<(), crate::Error>>
+    ) -> Result<(), crate::Error>
     where
         T: AsyncRead + AsyncWrite + Unpin,
     {
@@ -162,18 +149,15 @@ impl Connection {
             .get_mut(&channel)
             .ok_or_else(|| crate::Error::connection("invalid channel id"))?;
 
-        ready!(transport.poll_send_ready(cx))?;
-
-        transport.fill_buf(|mut buf| {
+        transport.fill_buf(|buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_WINDOW_ADJUST);
             buf.put_u32(channel.recipient_id.0);
             buf.put_u32(additional);
-            9
         })?;
 
         channel.recipient_window_size = channel.recipient_window_size.saturating_add(additional);
 
-        Poll::Ready(Ok(()))
+        Ok(())
     }
 
     pub fn poll_recv<T>(

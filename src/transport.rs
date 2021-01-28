@@ -316,10 +316,7 @@ where
         }
     }
 
-    pub fn poll_send_ready(
-        &mut self,
-        cx: &mut task::Context<'_>,
-    ) -> Poll<Result<(), crate::Error>> {
+    pub fn poll_ready(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
         let span = tracing::trace_span!("Transport::poll_send");
         let _enter = span.enter();
 
@@ -353,7 +350,7 @@ where
 
     pub fn fill_buf<F>(&mut self, payload: F) -> Result<(), crate::Error>
     where
-        F: FnOnce(&mut [u8]) -> usize,
+        F: FnOnce(&mut SendBuf<'_>),
     {
         let span = tracing::trace_span!("Transport::send");
         let _enter = span.enter();
@@ -454,6 +451,7 @@ struct SendPacket {
 
 enum SendPacketState {
     Available,
+    Buffering,
     Writing(usize),
     Flushing,
 }
@@ -473,38 +471,50 @@ impl SendPacket {
     #[inline]
     fn fill_buf<F>(&mut self, fill_payload: F) -> Result<(), crate::Error>
     where
-        F: FnOnce(&mut [u8]) -> usize,
+        F: FnOnce(&mut SendBuf<'_>),
     {
         assert!(
-            matches!(self.state, SendPacketState::Available),
-            "buffer is not empty"
+            matches!(
+                self.state,
+                SendPacketState::Available | SendPacketState::Buffering
+            ),
+            "not ready to buffer data"
         );
+        self.state = SendPacketState::Buffering;
 
-        let payload_length = fill_payload(&mut self.buf[4 + 1..]); // packet_length(u32) + padding_length(u8)
+        let buf = &mut self.buf[self.filled..];
+
+        let payload_length = {
+            let mut send_buf = SendBuf {
+                buf: &mut buf[4 + 1..], // packet_length(u32) + padding_length(u8)
+                filled: 0,
+            };
+            fill_payload(&mut send_buf);
+            send_buf.filled
+        };
         tracing::trace!("--> payload_length = {}", payload_length);
 
         let padding_length = self.key.padding_length(payload_length);
         let packet_length = 1 + payload_length + padding_length;
-        tracing::trace!("--> packet_length = {}", packet_length);
-        tracing::trace!("--> padding_length = {}", padding_length);
 
-        self.buf[..4].copy_from_slice(&(packet_length as u32).to_be_bytes());
-        self.buf[4] = padding_length as u8;
+        let encrypted_packet_length = 4 + packet_length + self.key.tag_len();
+        self.filled += encrypted_packet_length;
+        let buf = &mut buf[..encrypted_packet_length];
+
+        buf[..4].copy_from_slice(&(packet_length as u32).to_be_bytes());
+        buf[4] = padding_length as u8;
         unsafe {
-            let padding = &mut self.buf[5 + payload_length..5 + payload_length + padding_length];
+            let padding = &mut buf[5 + payload_length..5 + payload_length + padding_length];
             std::ptr::write_bytes(padding.as_mut_ptr(), 0, padding.len());
         }
 
-        self.filled = 4 + packet_length + self.key.tag_len();
-
         tracing::trace!("encrypt packet");
         {
-            let (packet, tag) = self.buf[..self.filled].split_at_mut(4 + packet_length);
+            let (packet, tag) = buf.split_at_mut(4 + packet_length);
             assert_eq!(tag.len(), self.key.tag_len());
             self.key.seal_in_place(self.seqn.0, packet, tag)?;
         }
 
-        self.state = SendPacketState::Writing(0);
         self.seqn += num::Wrapping(1);
 
         Ok(())
@@ -521,7 +531,13 @@ impl SendPacket {
         let mut stream = Pin::new(stream);
         loop {
             match self.state {
-                SendPacketState::Available => return Poll::Ready(Ok(())),
+                SendPacketState::Available => {
+                    return Poll::Ready(Ok(()));
+                }
+
+                SendPacketState::Buffering => {
+                    self.state = SendPacketState::Writing(0);
+                }
 
                 SendPacketState::Writing(ref mut written) => {
                     let mut buf = &self.buf[*written..self.filled];
@@ -550,6 +566,35 @@ impl SendPacket {
                 }
             }
         }
+    }
+}
+
+pub struct SendBuf<'a> {
+    buf: &'a mut [u8],
+    filled: usize,
+}
+unsafe impl BufMut for SendBuf<'_> {
+    #[inline]
+    fn remaining_mut(&self) -> usize {
+        self.buf.len() - self.filled
+    }
+
+    #[inline]
+    fn chunk_mut(&mut self) -> &mut UninitSlice {
+        let remaining = &mut self.buf[self.filled..];
+        unsafe { UninitSlice::from_raw_parts_mut(remaining.as_mut_ptr(), remaining.len()) }
+    }
+
+    #[inline]
+    unsafe fn advance_mut(&mut self, cnt: usize) {
+        self.filled += cnt;
+    }
+
+    #[inline]
+    fn put_slice(&mut self, src: &[u8]) {
+        assert!(self.remaining_mut() >= src.len(), "slice is too large");
+        self.buf[self.filled..self.filled + src.len()].copy_from_slice(src);
+        self.filled += src.len();
     }
 }
 
@@ -808,9 +853,8 @@ impl KeyExchange {
                     tracing::trace!("--> SendingClientKexInit");
 
                     ready!(send.poll_flush(cx, stream))?;
-                    send.fill_buf(|mut buf| {
+                    send.fill_buf(|buf| {
                         buf.put_slice(&self.client_kexinit_payload[..]);
-                        self.client_kexinit_payload.len()
                     })?;
                     self.state = KeyExchangeState::SendingEcdhInit;
                 }
@@ -824,7 +868,6 @@ impl KeyExchange {
                     send.fill_buf(|mut buf| {
                         buf.put_u8(consts::SSH_MSG_KEX_ECDH_INIT);
                         put_ssh_string(&mut buf, client_public_key.as_ref());
-                        1 + 4 + client_public_key.as_ref().len()
                     })?;
 
                     self.state = KeyExchangeState::ReceivingEcdhReply;
@@ -958,9 +1001,8 @@ impl KeyExchange {
 
                     ready!(send.poll_flush(cx, stream))?;
 
-                    send.fill_buf(|mut buf| {
+                    send.fill_buf(|buf| {
                         buf.put_u8(consts::SSH_MSG_NEWKEYS);
-                        1
                     })?;
 
                     self.state = KeyExchangeState::ReceivingServerNewKeys;
