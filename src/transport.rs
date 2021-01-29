@@ -40,18 +40,6 @@ pub struct Transport<T> {
 
 enum TransportState {
     Init,
-    WriteClientSshId {
-        line: Vec<u8>,
-        written: usize,
-    },
-    FlushClientSshId,
-    ReadServerSshId {
-        buf: BytesMut,
-    },
-    WaitingServerKexInit {
-        recv_buf: Box<[u8]>,
-        remains: Option<Bytes>,
-    },
     Kex,
     Ready,
     Disconnected,
@@ -91,141 +79,8 @@ where
             match self.state {
                 TransportState::Init => {
                     tracing::trace!("--> Init");
-                    self.state = TransportState::WriteClientSshId {
-                        line: {
-                            let mut line = CLIENT_SSH_ID.to_owned();
-                            line.put_slice(b"\r\n");
-                            line
-                        },
-                        written: 0,
-                    };
-                }
-
-                TransportState::WriteClientSshId {
-                    ref line,
-                    ref mut written,
-                } => {
-                    tracing::trace!("--> WriteClientSshId(written = {})", written);
-
-                    let mut stream = Pin::new(&mut self.stream);
-
-                    let mut buf = &line[*written..];
-                    while buf.has_remaining() {
-                        let amt = ready!(stream.as_mut().poll_write(cx, buf))
-                            .map_err(crate::Error::io)?;
-                        buf.advance(amt);
-                        *written += amt;
-                    }
-
-                    self.state = TransportState::FlushClientSshId;
-                }
-
-                TransportState::FlushClientSshId => {
-                    tracing::trace!("--> FlushClientSshId");
-
-                    let mut stream = Pin::new(&mut self.stream);
-                    ready!(stream.as_mut().poll_flush(cx)).map_err(crate::Error::io)?;
-
-                    self.state = TransportState::ReadServerSshId {
-                        buf: BytesMut::with_capacity(256), // TODO: choose appropriate buffer size
-                    };
-                }
-
-                TransportState::ReadServerSshId { ref mut buf } => {
-                    tracing::trace!(
-                        "--> ReadServerSshId(buf = {:?})",
-                        String::from_utf8_lossy(&buf)
-                    );
-
-                    let mut stream = Pin::new(&mut self.stream);
-
-                    unsafe {
-                        let mut read_buf = ReadBuf::uninit(std::slice::from_raw_parts_mut(
-                            buf.as_mut_ptr() as *mut MaybeUninit<u8>,
-                            buf.capacity(),
-                        ));
-                        read_buf.assume_init(buf.len());
-                        read_buf.set_filled(buf.len());
-
-                        let rem = read_buf.remaining();
-                        ready!(stream.as_mut().poll_read(cx, &mut read_buf))
-                            .map_err(crate::Error::io)?;
-                        if rem == read_buf.remaining() {
-                            return Poll::Ready(Err(crate::Error::io(eof("recv server SSH id"))));
-                        }
-
-                        buf.set_len(read_buf.filled().len());
-                    }
-
-                    let (server_id, remains) = match buf.iter().position(|&b| b == b'\n') {
-                        Some(pos) => {
-                            let mut line = buf.split_to(pos + 1); // including \n
-                            if !line.starts_with(b"SSH-") {
-                                // ignore banner text.
-                                continue;
-                            }
-
-                            let buf = std::mem::take(buf);
-
-                            let n = line
-                                .iter()
-                                .take_while(|&&c| c != b'\r' && c != b'\n')
-                                .count();
-                            line.truncate(n);
-
-                            (line.freeze(), buf.freeze())
-                        }
-                        None => {
-                            // continue reading line.
-                            continue;
-                        }
-                    };
-
-                    tracing::trace!("--> server_id = {:?}", String::from_utf8_lossy(&server_id));
-
-                    self.kex.server_id = server_id.to_vec();
-                    self.state = TransportState::WaitingServerKexInit {
-                        recv_buf: vec![0u8; 0x10000].into_boxed_slice(),
-                        remains: Some(remains),
-                    };
-                }
-
-                TransportState::WaitingServerKexInit {
-                    ref mut recv_buf,
-                    ref mut remains,
-                } => {
-                    tracing::trace!("--> WaitingServerKexInit");
-
-                    let range = ready!(self.recv.poll_recv(
-                        cx,
-                        &mut Rewind {
-                            stream: &mut self.stream,
-                            remains,
-                        },
-                        recv_buf
-                    ))?;
-                    debug_assert!(remains.as_ref().map_or(true, |buf| buf.is_empty()));
-
-                    let mut payload = &recv_buf[range];
-
-                    match peek_u8(&payload) {
-                        Some(consts::SSH_MSG_DISCONNECT) => {
-                            // TODO: parse disconnect message
-                            self.state = TransportState::Disconnected;
-                        }
-
-                        Some(consts::SSH_MSG_KEXINIT) => {
-                            tracing::trace!("--> KEXINIT");
-                            self.kex.start(&mut payload, &self.rng)?;
-                            self.state = TransportState::Kex;
-                        }
-
-                        Some(typ) => {
-                            tracing::trace!("--> {}, ignoring", typ);
-                        }
-
-                        None => panic!("payload is too short"),
-                    }
+                    self.kex.start_client_kex(&mut self.send, &self.rng, true)?;
+                    self.state = TransportState::Kex;
                 }
 
                 TransportState::Kex => {
@@ -262,11 +117,7 @@ where
 
         loop {
             match self.state {
-                TransportState::Init
-                | TransportState::WriteClientSshId { .. }
-                | TransportState::FlushClientSshId
-                | TransportState::ReadServerSshId { .. }
-                | TransportState::WaitingServerKexInit { .. } => {
+                TransportState::Init => {
                     panic!("called before poll_handshake() completed")
                 }
 
@@ -274,7 +125,7 @@ where
                     tracing::trace!("--> Ready");
 
                     let range = ready!(self.recv.poll_recv(cx, &mut self.stream, recv_buf))?;
-                    let mut payload = &recv_buf[range.clone()];
+                    let payload = &recv_buf[range.clone()];
 
                     match peek_u8(&payload) {
                         Some(consts::SSH_MSG_DISCONNECT) => {
@@ -291,7 +142,8 @@ where
 
                         Some(consts::SSH_MSG_KEXINIT) => {
                             tracing::trace!("--> KEXINIT");
-                            self.kex.start(&mut payload, &self.rng)?;
+                            self.kex
+                                .start_server_kex(&mut self.send, &self.rng, payload)?;
                             self.state = TransportState::Kex;
                         }
 
@@ -322,11 +174,7 @@ where
 
         loop {
             match self.state {
-                TransportState::Init
-                | TransportState::WriteClientSshId { .. }
-                | TransportState::FlushClientSshId
-                | TransportState::ReadServerSshId { .. }
-                | TransportState::WaitingServerKexInit { .. } => {
+                TransportState::Init => {
                     panic!("called before poll_handshake() completed")
                 }
 
@@ -360,7 +208,7 @@ where
             "transport is not ready to send"
         );
 
-        self.send.fill_buf(payload)?;
+        self.send.put_packet(payload)?;
 
         Ok(())
     }
@@ -378,7 +226,12 @@ where
             "unexpected condition"
         );
 
-        let (opening_key, sealing_key, exchange_hash) = ready!(self.kex.poll_complete(
+        let KexResult {
+            opening_key,
+            sealing_key,
+            exchange_hash,
+            ..
+        } = ready!(self.kex.poll_complete(
             cx,
             &mut self.stream,
             &mut self.send,
@@ -386,8 +239,8 @@ where
             self.session_id.as_ref(),
         ))?;
 
-        self.recv.key = OpeningKey::Chacha20Poly1305(opening_key);
-        self.send.key = SealingKey::Chacha20Poly1305(sealing_key);
+        self.recv.key = opening_key;
+        self.send.key = sealing_key;
 
         // The first exchange hash is used as 'session id'.
         self.session_id.get_or_insert(exchange_hash);
@@ -399,43 +252,6 @@ where
 
     pub(crate) fn session_id(&self) -> &digest::Digest {
         self.session_id.as_ref().unwrap()
-    }
-}
-
-pin_project! {
-    struct Rewind<'a, T> {
-        #[pin]
-        stream: T,
-        remains: &'a mut Option<Bytes>,
-    }
-}
-
-impl<T> AsyncRead for Rewind<'_, T>
-where
-    T: AsyncRead,
-{
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let me = self.project();
-
-        if let Some(ref mut remains) = me.remains {
-            if !remains.is_empty() {
-                let amt = cmp::min(remains.len(), buf.remaining());
-                buf.put_slice(&remains[..amt]);
-                remains.advance(amt);
-
-                if remains.is_empty() {
-                    me.remains.take();
-                }
-
-                return Poll::Ready(Ok(()));
-            }
-        }
-
-        me.stream.poll_read(cx, buf)
     }
 }
 
@@ -469,7 +285,7 @@ impl SendPacket {
     }
 
     #[inline]
-    fn fill_buf<F>(&mut self, fill_payload: F) -> Result<(), crate::Error>
+    fn put_packet<F>(&mut self, fill_payload: F) -> Result<(), crate::Error>
     where
         F: FnOnce(&mut SendBuf<'_>),
     {
@@ -566,6 +382,12 @@ impl SendPacket {
                 }
             }
         }
+    }
+
+    fn put_slice(&mut self, s: &[u8]) {
+        let mut buf = &mut self.buf[..];
+        buf.put_slice(s);
+        self.filled += s.len();
     }
 }
 
@@ -781,58 +603,27 @@ impl Default for KeyExchange {
 }
 
 impl KeyExchange {
-    fn start<B>(
+    /// Start a key exchange session starting from the client side.
+    fn start_client_kex(
         &mut self,
-        server_kexinit_payload: &mut B,
-        rng: &rand::SystemRandom,
-    ) -> Result<(), crate::Error>
-    where
-        B: Buf,
-    {
-        let span = tracing::trace_span!("start_kex");
-        let _enter = span.enter();
-
-        match self.state {
-            KeyExchangeState::Init | KeyExchangeState::Exchanged => (),
-            _ => panic!("key exchange is not completed"),
-        }
-
-        let mut digest = digest::Context::new(&digest::SHA256);
-        digest_ssh_string(&mut digest, &CLIENT_SSH_ID[..]);
-        digest_ssh_string(&mut digest, &self.server_id[..]);
-
-        // set client kexinit.
-        tracing::trace!("init client_kex_payload");
-        self.client_kexinit_payload = client_kex_payload(rng)?;
-        digest_ssh_string(&mut digest, &self.client_kexinit_payload[..]);
-        digest_ssh_string(&mut digest, server_kexinit_payload);
-
-        // Generate ephemeral ECDH key.
-        tracing::trace!("init ephemeral ECDH key");
-        self.client_ephemeral_key = Some({
-            let private_key = agreement::EphemeralPrivateKey::generate(&agreement::X25519, rng)
-                .map_err(|_| crate::Error::transport("failed to generate ephemeral private key"))?;
-            let public_key = private_key
-                .compute_public_key()
-                .map_err(|_| crate::Error::transport("failed to compute ephemeral public key"))?;
-            (private_key, public_key)
-        });
-
-        self.digest = Some(digest);
-        self.state = KeyExchangeState::SendingClientKexInit;
-
-        Ok(())
+        send: &mut SendPacket,
+        rng: &dyn rand::SecureRandom,
+        exchange_ssh_id: bool,
+    ) -> Result<(), crate::Error> {
+        todo!()
     }
 
-    fn client_public_key(&self) -> &agreement::PublicKey {
-        &self
-            .client_ephemeral_key
-            .as_ref()
-            .expect("ephemeral key is not available")
-            .1
+    /// Start a key exchange session starting from the server side.
+    fn start_server_kex(
+        &mut self,
+        send: &mut SendPacket,
+        rng: &dyn rand::SecureRandom,
+        server_kexinit_payload: &[u8],
+    ) -> Result<(), crate::Error> {
+        todo!()
     }
 
-    #[allow(clippy::clippy::too_many_arguments)]
+    /// Complete key exchange session.
     fn poll_complete<T>(
         &mut self,
         cx: &mut task::Context<'_>,
@@ -840,229 +631,19 @@ impl KeyExchange {
         send: &mut SendPacket,
         recv: &mut RecvPacket,
         session_id: Option<&digest::Digest>,
-    ) -> Poll<Result<(aead::OpeningKey, aead::SealingKey, digest::Digest), crate::Error>>
+    ) -> Poll<Result<KexResult, crate::Error>>
     where
         T: AsyncRead + AsyncWrite + Unpin,
     {
-        let span = tracing::trace_span!("KeyExchange::poll_complete_kex");
-        let _enter = span.enter();
-
-        loop {
-            match self.state {
-                KeyExchangeState::SendingClientKexInit => {
-                    tracing::trace!("--> SendingClientKexInit");
-
-                    ready!(send.poll_flush(cx, stream))?;
-                    send.fill_buf(|buf| {
-                        buf.put_slice(&self.client_kexinit_payload[..]);
-                    })?;
-                    self.state = KeyExchangeState::SendingEcdhInit;
-                }
-
-                KeyExchangeState::SendingEcdhInit => {
-                    tracing::trace!("--> SendingEcdhInit");
-
-                    ready!(send.poll_flush(cx, stream))?;
-
-                    let client_public_key = self.client_public_key();
-                    send.fill_buf(|mut buf| {
-                        buf.put_u8(consts::SSH_MSG_KEX_ECDH_INIT);
-                        put_ssh_string(&mut buf, client_public_key.as_ref());
-                    })?;
-
-                    self.state = KeyExchangeState::ReceivingEcdhReply;
-                }
-
-                KeyExchangeState::ReceivingEcdhReply => {
-                    tracing::trace!("--> ReceivingEcdhReply");
-
-                    ready!(send.poll_flush(cx, stream))?;
-
-                    let range = ready!(recv.poll_recv(cx, stream, &mut self.recv_buf))?;
-                    let mut payload = &self.recv_buf[range];
-
-                    let mut digest = self.digest.take().unwrap();
-                    let client_public_key = self.client_public_key();
-
-                    if payload.get_u8() != consts::SSH_MSG_KEX_ECDH_REPLY {
-                        return Poll::Ready(Err(crate::Error::transport(
-                            "reply is not ECDH_REPLY",
-                        )));
-                    }
-
-                    let server_host_key = {
-                        let raw = get_ssh_string(&mut payload);
-                        let mut raw = &raw[..];
-
-                        digest_ssh_string(&mut digest, raw);
-
-                        let key_type = get_ssh_string(&mut raw);
-                        match &*key_type {
-                            b"ssh-ed25519" => {
-                                // ref: https://tools.ietf.org/html/rfc8709#section-4
-                                let key = get_ssh_string(&mut raw);
-                                signature::UnparsedPublicKey::new(&signature::ED25519, key)
-                            }
-                            _ => {
-                                return Poll::Ready(Err(crate::Error::transport(
-                                    "unexpected server host key type",
-                                )))
-                            }
-                        }
-                    };
-                    // TODO: verify server host key.
-
-                    let server_public_key = {
-                        let raw = get_ssh_string(&mut payload);
-
-                        digest_ssh_string(&mut digest, client_public_key.as_ref());
-                        digest_ssh_string(&mut digest, &raw[..]);
-
-                        agreement::UnparsedPublicKey::new(&agreement::X25519, raw)
-                    };
-
-                    let exchange_hash_sig = {
-                        tracing::trace!("parse exchange_hash_sig (len = {})", payload.remaining());
-                        let raw = get_ssh_string(&mut payload);
-                        let mut raw = &raw[..];
-
-                        let key_type = get_ssh_string(&mut raw);
-                        match &*key_type {
-                            b"ssh-ed25519" => {
-                                // ref: https://tools.ietf.org/html/rfc8709#section-6
-                                get_ssh_string(&mut raw)
-                            }
-                            _ => {
-                                return Poll::Ready(Err(crate::Error::transport(
-                                    "unexpected exchange hash signature type",
-                                )))
-                            }
-                        }
-                    };
-
-                    let (client_private_key, _) = self.client_ephemeral_key.take().unwrap();
-                    agreement::agree_ephemeral(
-                        client_private_key,
-                        &server_public_key,
-                        crate::Error::transport("errored during key agreement"),
-                        {
-                            let slot_out = &mut self.output;
-                            move |secret| {
-                                tracing::trace!("calculate exchange hash H");
-                                let exchange_hash = {
-                                    digest_ssh_mpint(&mut digest, secret);
-                                    digest.finish()
-                                };
-                                server_host_key
-                                    .verify(exchange_hash.as_ref(), &exchange_hash_sig[..])
-                                    .map_err(|_| {
-                                        crate::Error::transport("exchange hash mismatched")
-                                    })?;
-
-                                tracing::trace!("calculate encryption keys");
-                                let session_id = session_id.unwrap_or(&exchange_hash);
-                                let sealing_key = {
-                                    let mut key = [0u8; aead::KEY_LEN];
-                                    let mut key_buf = KeyBuf::new(&mut key[..]);
-                                    compute_key(
-                                        &mut key_buf,
-                                        b'C',
-                                        secret,
-                                        &exchange_hash,
-                                        session_id,
-                                    )?;
-                                    aead::SealingKey::new(&key)
-                                };
-                                let opening_key = {
-                                    let mut key = [0u8; aead::KEY_LEN];
-                                    let mut key_buf = KeyBuf::new(&mut key[..]);
-                                    compute_key(
-                                        &mut key_buf,
-                                        b'D',
-                                        secret,
-                                        &exchange_hash,
-                                        session_id,
-                                    )?;
-                                    aead::OpeningKey::new(&key)
-                                };
-
-                                *slot_out = Some((opening_key, sealing_key, exchange_hash));
-
-                                Ok(())
-                            }
-                        },
-                    )?;
-
-                    self.state = KeyExchangeState::SendingClientNewKeys;
-                }
-
-                KeyExchangeState::SendingClientNewKeys => {
-                    tracing::trace!("--> SendingClientNewKeys");
-
-                    ready!(send.poll_flush(cx, stream))?;
-
-                    send.fill_buf(|buf| {
-                        buf.put_u8(consts::SSH_MSG_NEWKEYS);
-                    })?;
-
-                    self.state = KeyExchangeState::ReceivingServerNewKeys;
-                }
-
-                KeyExchangeState::ReceivingServerNewKeys => {
-                    tracing::trace!("--> ReceivingServerNewKeys");
-
-                    ready!(send.poll_flush(cx, stream))?;
-
-                    let range = ready!(recv.poll_recv(cx, stream, &mut self.recv_buf))?;
-                    let mut payload = &self.recv_buf[range];
-
-                    if payload.get_u8() != consts::SSH_MSG_NEWKEYS {
-                        // TODO: send DISCONNECT
-                        return Poll::Ready(Err(crate::Error::transport("is not NEWKEYS")));
-                    }
-
-                    self.state = KeyExchangeState::Exchanged;
-
-                    return Poll::Ready(Ok(self.output.take().unwrap()));
-                }
-
-                KeyExchangeState::Init | KeyExchangeState::Exchanged => panic!("unexpected state"),
-            }
-        }
+        todo!()
     }
 }
 
-fn client_kex_payload(rng: &rand::SystemRandom) -> Result<Vec<u8>, crate::Error> {
-    let mut payload = vec![];
-    payload.put_u8(consts::SSH_MSG_KEXINIT);
-
-    let cookie = ring::rand::generate::<[u8; 16]>(rng)
-        .map_err(|_| crate::Error::transport("failed to generate random"))?
-        .expose();
-    payload.put_slice(&cookie[..]);
-
-    put_ssh_string(&mut payload, CURVE25519_SHA256.as_ref()); // kex_algorithms
-    put_ssh_string(&mut payload, b"ssh-ed25519"); // server_host_key_algorithms
-
-    put_ssh_string(&mut payload, CHACHA20_POLY1305.as_ref()); // encryption_algorithms_client_to_server
-    put_ssh_string(&mut payload, CHACHA20_POLY1305.as_ref()); // encryption_algorithms_server_to_client
-
-    put_ssh_string(&mut payload, b"none"); // mac_algorithms_client_to_server
-    put_ssh_string(&mut payload, b"none"); // mac_algorithms_server_to_client
-
-    put_ssh_string(&mut payload, b"none"); // compression_algorithms_client_to_server
-    put_ssh_string(&mut payload, b"none"); // compression_algorithms_server_to_client
-
-    put_ssh_string(&mut payload, b""); // languages_client_to_server
-    put_ssh_string(&mut payload, b""); // languages_server_to_client
-
-    payload.put_u8(0); // first_kex_packet_follows
-    payload.put_u32(0); // reserved
-
-    Ok(payload)
+struct KexResult {
+    opening_key: OpeningKey,
+    sealing_key: SealingKey,
+    exchange_hash: digest::Digest,
 }
-
-// ==== ciphers ====
 
 enum OpeningKey {
     ClearText,
@@ -1167,37 +748,6 @@ impl SealingKey {
     }
 }
 
-// ==== misc ====
-
-fn digest_ssh_string<B: Buf>(digest: &mut digest::Context, mut data: B) {
-    let len = data.remaining() as u32;
-    digest.update(&len.to_be_bytes());
-    while data.has_remaining() {
-        digest.update(data.chunk());
-        data.advance(data.chunk().len());
-    }
-}
-
-fn digest_ssh_mpint(digest: &mut digest::Context, s: &[u8]) {
-    // Skip initial 0s.
-    let mut i = 0;
-    while i < s.len() && s[i] == 0 {
-        i += 1;
-    }
-
-    // If the first non-zero is >= 128, write its length (u32, BE), followed by 0.
-    if s[i] & 0x80 != 0 {
-        digest.update(&((s.len() - i + 1) as u32).to_be_bytes());
-        digest.update(&[0]);
-    } else {
-        digest.update(&((s.len() - i) as u32).to_be_bytes());
-    }
-
-    digest.update(&s[i..]);
-}
-
-// ==== compute_key ====
-
 struct KeyBuf<'a> {
     data: &'a mut [u8],
     filled: usize,
@@ -1267,6 +817,74 @@ fn compute_key(
 
     Ok(())
 }
+
+pin_project! {
+    struct Rewind<'a, T> {
+        #[pin]
+        stream: T,
+        remains: &'a mut Option<Bytes>,
+    }
+}
+
+impl<T> AsyncRead for Rewind<'_, T>
+where
+    T: AsyncRead,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let me = self.project();
+
+        if let Some(ref mut remains) = me.remains {
+            if !remains.is_empty() {
+                let amt = cmp::min(remains.len(), buf.remaining());
+                buf.put_slice(&remains[..amt]);
+                remains.advance(amt);
+
+                if remains.is_empty() {
+                    me.remains.take();
+                }
+
+                return Poll::Ready(Ok(()));
+            }
+        }
+
+        me.stream.poll_read(cx, buf)
+    }
+}
+
+// ==== misc ====
+
+fn digest_ssh_string<B: Buf>(digest: &mut digest::Context, mut data: B) {
+    let len = data.remaining() as u32;
+    digest.update(&len.to_be_bytes());
+    while data.has_remaining() {
+        digest.update(data.chunk());
+        data.advance(data.chunk().len());
+    }
+}
+
+fn digest_ssh_mpint(digest: &mut digest::Context, s: &[u8]) {
+    // Skip initial 0s.
+    let mut i = 0;
+    while i < s.len() && s[i] == 0 {
+        i += 1;
+    }
+
+    // If the first non-zero is >= 128, write its length (u32, BE), followed by 0.
+    if s[i] & 0x80 != 0 {
+        digest.update(&((s.len() - i + 1) as u32).to_be_bytes());
+        digest.update(&[0]);
+    } else {
+        digest.update(&((s.len() - i) as u32).to_be_bytes());
+    }
+
+    digest.update(&s[i..]);
+}
+
+// ==== compute_key ====
 
 fn eof(msg: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
     io::Error::new(io::ErrorKind::UnexpectedEof, msg)
