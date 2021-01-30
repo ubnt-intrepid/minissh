@@ -50,7 +50,7 @@ impl Connection {
     {
         let sender_channel = self.allocate_channel();
 
-        transport.fill_buf(|mut buf| {
+        transport.send(|mut buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_OPEN);
             put_ssh_string(&mut buf, b"session");
             buf.put_u32(sender_channel.0);
@@ -99,7 +99,7 @@ impl Connection {
             .get_mut(&channel)
             .ok_or_else(|| crate::Error::connection("invalid channel id"))?;
 
-        transport.fill_buf(|mut buf| {
+        transport.send(|mut buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_REQUEST);
             buf.put_u32(channel.recipient_id.0);
             put_ssh_string(&mut buf, b"exec");
@@ -125,7 +125,7 @@ impl Connection {
             None => return Ok(()), // do nothing
         };
 
-        transport.fill_buf(|buf| {
+        transport.send(|buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_CLOSE);
             buf.put_u32(channel.recipient_id.0);
         })?;
@@ -149,7 +149,7 @@ impl Connection {
             .get_mut(&channel)
             .ok_or_else(|| crate::Error::connection("invalid channel id"))?;
 
-        transport.fill_buf(|buf| {
+        transport.send(|buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_WINDOW_ADJUST);
             buf.put_u32(channel.recipient_id.0);
             buf.put_u32(additional);

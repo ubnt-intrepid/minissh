@@ -1,8 +1,8 @@
-//! The implementation of SSH transport protocol.
+/*!
+The implementation of SSH transport layer protocol, described in [RFC 4253].
 
-// Refs:
-// * https://tools.ietf.org/html/rfc4253
-// * https://tools.ietf.org/html/rfc5656
+[RFC 4253]: https://tools.ietf.org/html/rfc4253
+*/
 
 use crate::{
     consts,
@@ -28,6 +28,7 @@ const CLIENT_SSH_ID: &[u8] = concat!("SSH-2.0-minissh_", env!("CARGO_PKG_VERSION
 
 // ==== Transport ====
 
+/// The object that drives SSH transport layer.
 pub struct Transport<T> {
     stream: T,
     state: TransportState,
@@ -61,6 +62,7 @@ impl<T> Transport<T>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    /// Create a new `Transport` with the specified I/O object.
     pub fn new(stream: T) -> Self {
         Self {
             stream,
@@ -73,16 +75,22 @@ where
         }
     }
 
+    /// Return a reference to underlying I/O object.
     #[inline]
     pub fn get_ref(&self) -> &T {
         &self.stream
     }
 
+    /// Return a mutable reference to underlying I/O object.
     #[inline]
     pub fn get_mut(&mut self) -> &mut T {
         &mut self.stream
     }
 
+    /// Run the first key exchange negotiation and set up the encrypted connection to the server.
+    ///
+    /// This function must be called after creating the instance, and completed before
+    /// any other operations, such as `poll_recv` are called.
     pub fn poll_handshake(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
         let span = tracing::trace_span!("Transport::poll_handshake");
         let _enter = span.enter();
@@ -242,6 +250,15 @@ where
         }
     }
 
+    /// Receive a packet from the peer.
+    ///
+    /// `recv_buf` is used for reading the cipher text and decrypting,
+    /// and must have enough capacity for storing intermediate data.
+    /// After decryption, the payload part is returned as a sub slice of
+    /// `recv_buf`.
+    ///
+    /// Several packet types, such as key exchange negotiation, are filtered out
+    /// and handle by the transport.
     #[inline]
     pub fn poll_recv<'a>(
         &mut self,
@@ -316,7 +333,11 @@ where
         }
     }
 
-    pub fn poll_ready(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
+    /// Wait for a new packet is avilable to send.
+    pub fn poll_send_ready(
+        &mut self,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), crate::Error>> {
         let span = tracing::trace_span!("Transport::poll_send");
         let _enter = span.enter();
 
@@ -348,9 +369,15 @@ where
         }
     }
 
-    pub fn fill_buf<F>(&mut self, payload: F) -> Result<(), crate::Error>
+    /// Append a packet to the send buffer.
+    ///
+    /// This function should be called after `poll_send_ready` returns `Poll::Ready(Ok(()))`.
+    ///
+    /// Note that the packet added by this function will not write to the server before calling
+    /// `poll_flush` or `poll_send_ready`.
+    pub fn send<F>(&mut self, payload: F) -> Result<(), crate::Error>
     where
-        F: FnOnce(&mut SendBuf<'_>),
+        F: FnOnce(&mut dyn BufMut),
     {
         let span = tracing::trace_span!("Transport::send");
         let _enter = span.enter();
@@ -365,10 +392,12 @@ where
         Ok(())
     }
 
+    /// Flush the internal buffer to the I/O.
+    ///
+    /// Unlike `poll_send_ready`, this function does not progress the internal key exchange
+    /// process and immediately returns after the buffer is flushed.
+    #[inline]
     pub fn poll_flush(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
-        let span = tracing::trace_span!("Transport::poll_flush");
-        let _enter = span.enter();
-
         self.send.poll_flush(cx, &mut self.stream)
     }
 
@@ -471,7 +500,7 @@ impl SendPacket {
     #[inline]
     fn fill_buf<F>(&mut self, fill_payload: F) -> Result<(), crate::Error>
     where
-        F: FnOnce(&mut SendBuf<'_>),
+        F: FnOnce(&mut dyn BufMut),
     {
         assert!(
             matches!(
@@ -569,7 +598,7 @@ impl SendPacket {
     }
 }
 
-pub struct SendBuf<'a> {
+struct SendBuf<'a> {
     buf: &'a mut [u8],
     filled: usize,
 }

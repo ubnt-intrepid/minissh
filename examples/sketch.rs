@@ -24,7 +24,7 @@ async fn main() -> Result<()> {
     poll_fn(|cx| userauth.poll_service_request(cx, &mut transport)).await?;
 
     poll_fn(|cx| {
-        ready!(transport.poll_ready(cx))?;
+        ready!(transport.poll_send_ready(cx))?;
         userauth
             .send_userauth(
                 &mut transport,

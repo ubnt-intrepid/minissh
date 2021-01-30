@@ -1,7 +1,8 @@
-//! Manages authentication process described in RFC4252.
+/*!
+The implementation of SSH authentication protocol, described in [RFC 4252].
 
-// Refs:
-// * https://tools.ietf.org/html/rfc4252
+[RFC 4252]: https://tools.ietf.org/html/rfc4252
+*/
 
 use crate::{
     consts,
@@ -16,6 +17,7 @@ use futures::{
 use std::collections::VecDeque;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+/// The object that manages authentication state during a SSH session.
 pub struct Userauth {
     state: AuthState,
     pending_auths: VecDeque<PendingAuth>,
@@ -56,8 +58,8 @@ impl Userauth {
         loop {
             match self.state {
                 AuthState::Init => {
-                    ready!(transport.poll_ready(cx))?;
-                    transport.fill_buf(|buf| {
+                    ready!(transport.poll_send_ready(cx))?;
+                    transport.send(|buf| {
                         buf.put_slice(b"\x05\x00\x00\x00\x0Cssh-userauth");
                     })?;
 
@@ -101,7 +103,7 @@ impl Userauth {
     {
         assert!(matches!(self.state, AuthState::AuthRequests));
 
-        transport.fill_buf(|mut buf| {
+        transport.send(|mut buf| {
             buf.put_u8(consts::SSH_MSG_USERAUTH_REQUEST);
             put_ssh_string(&mut buf, username.as_ref());
             put_ssh_string(&mut buf, b"ssh-connection"); // service name
