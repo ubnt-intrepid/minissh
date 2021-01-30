@@ -29,6 +29,7 @@ async fn main() -> Result<()> {
             .send_userauth(
                 &mut transport,
                 "devenv",
+                "ssh-connection",
                 AuthMethod::Password {
                     current: "devenv",
                     new: None,

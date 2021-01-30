@@ -9,7 +9,7 @@ use crate::{
     transport::Transport,
     util::{get_ssh_string, put_ssh_string},
 };
-use bytes::{Buf, BufMut};
+use bytes::Buf;
 use futures::{
     ready,
     task::{self, Poll},
@@ -91,11 +91,12 @@ impl Userauth {
         Poll::Ready(Ok(()))
     }
 
-    /// Request a password-based authentication.
+    /// Send an user authentication request.
     pub fn send_userauth<T>(
         &mut self,
         transport: &mut Transport<T>,
         username: &str,
+        service_name: &str,
         method: AuthMethod<'_>,
     ) -> Result<(), crate::Error>
     where
@@ -106,7 +107,7 @@ impl Userauth {
         transport.send(|mut buf| {
             buf.put_u8(consts::SSH_MSG_USERAUTH_REQUEST);
             put_ssh_string(&mut buf, username.as_ref());
-            put_ssh_string(&mut buf, b"ssh-connection"); // service name
+            put_ssh_string(&mut buf, service_name.as_ref());
             match method {
                 AuthMethod::PublicKey {
                     algorithm,
