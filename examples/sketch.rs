@@ -1,5 +1,10 @@
 use anyhow::Result;
 use futures::{future::poll_fn, ready};
+use minissh::{
+    connection::Connection,
+    transport::Transport,
+    userauth::{AuthMethod, AuthResult, Userauth},
+};
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
 
@@ -7,66 +12,50 @@ use tokio::net::TcpStream;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let mut agent = minissh::agent::Agent::connect().await?;
-
-    tracing::trace!("request identities");
-    poll_fn(|cx| {
-        futures::ready!(agent.poll_flush(cx))?;
-        agent.send_request_identities().into()
-    })
-    .await?;
-    tracing::trace!("fetch identities");
-    let identity = match poll_fn(|cx| agent.poll_recv(cx)).await? {
-        minissh::agent::Response::Identities(ident) => ident.into_iter().next().unwrap(),
-        _ => panic!("unexpected response type"),
-    };
-    tracing::trace!("--> {:?}", identity);
-
-    tracing::trace!("sign data");
-    poll_fn(|cx| {
-        futures::ready!(agent.poll_flush(cx))?;
-        agent
-            .send_sign_request(&identity, &mut &b"foo"[..], 0)
-            .into()
-    })
-    .await?;
-    let signature = match poll_fn(|cx| agent.poll_recv(cx)).await? {
-        minissh::agent::Response::SignResponse(sig) => sig,
-        _ => panic!("unexpected response type"),
-    };
-    tracing::trace!("--> {:?}", String::from_utf8_lossy(&signature));
-
     let addr = SocketAddr::from(([192, 168, 122, 10], 22));
 
     tracing::debug!("establish SSH transport (addr = {})", addr);
     let stream = TcpStream::connect(&addr).await?;
-    let mut transport = minissh::transport::Transport::new(stream);
+    let mut transport = Transport::new(stream);
     poll_fn(|cx| transport.poll_handshake(cx)).await?;
 
     tracing::debug!("userauth");
-    let mut userauth = minissh::userauth::Authenticator::default();
+    let mut userauth = Userauth::default();
     poll_fn(|cx| userauth.poll_service_request(cx, &mut transport)).await?;
 
     poll_fn(|cx| {
         ready!(transport.poll_ready(cx))?;
         userauth
-            .userauth_password(&mut transport, "devenv", "devenv")
+            .send_userauth(
+                &mut transport,
+                "devenv",
+                AuthMethod::Password {
+                    current: "devenv",
+                    new: None,
+                },
+            )
             .into()
     })
     .await?;
-
     loop {
         let res = poll_fn(|cx| userauth.poll_authenticate(cx, &mut transport)).await?;
         match res {
-            minissh::userauth::AuthResult::Success => break,
-            minissh::userauth::AuthResult::Failure { .. } => tracing::error!("auth failed"),
+            AuthResult::Success => {
+                tracing::debug!("--> success");
+                break;
+            }
+            AuthResult::Banner { message, .. } => {
+                tracing::debug!("--> banner(message = {:?})", std::str::from_utf8(&message));
+            }
+            AuthResult::Failure { .. } | AuthResult::PasswordChangeReq { .. } => {
+                anyhow::bail!("auth failed");
+            }
+            _ => unreachable!(),
         }
     }
-    tracing::debug!("--> success");
 
     tracing::debug!("connection");
-    let mut conn = minissh::connection::Connection::default();
-
+    let mut conn = Connection::default();
     let channel = conn.channel_open_session(&mut transport)?;
     loop {
         use minissh::connection::{ChannelResponse, Response};

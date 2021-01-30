@@ -17,6 +17,10 @@ pub(crate) const SSH_MSG_USERAUTH_REQUEST: u8 = 50;
 pub(crate) const SSH_MSG_USERAUTH_FAILURE: u8 = 51;
 pub(crate) const SSH_MSG_USERAUTH_SUCCESS: u8 = 52;
 pub(crate) const SSH_MSG_USERAUTH_BANNER: u8 = 53;
+// defined in https://tools.ietf.org/html/rfc4252#section-7
+pub(crate) const SSH_MSG_USERAUTH_PK_OK: u8 = 60;
+// defined in https://tools.ietf.org/html/rfc4252#section-8
+pub(crate) const SSH_MSG_USERAUTH_PASSWD_CHANGEREQ: u8 = 60;
 
 // defined in https://tools.ietf.org/html/rfc4254#section-9
 pub(crate) const SSH_MSG_GLOBAL_REQUEST: u8 = 80;
