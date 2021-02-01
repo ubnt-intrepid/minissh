@@ -49,13 +49,11 @@ impl Userauth {
     pub fn poll_service_request<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-        transport: &mut T,
+        mut transport: Pin<&mut T>,
     ) -> Poll<Result<(), crate::Error>>
     where
-        T: Transport + Unpin,
+        T: Transport,
     {
-        let mut transport = Pin::new(transport);
-
         loop {
             match self.state {
                 AuthState::Init => {
@@ -95,17 +93,17 @@ impl Userauth {
     /// Send an user authentication request.
     pub fn send_userauth<T>(
         &mut self,
-        transport: &mut T,
+        transport: Pin<&mut T>,
         username: &str,
         service_name: &str,
         method: AuthMethod<'_>,
     ) -> Result<(), crate::Error>
     where
-        T: Transport + Unpin,
+        T: Transport,
     {
         assert!(matches!(self.state, AuthState::AuthRequests));
 
-        Pin::new(transport).send(|mut buf| {
+        transport.send(|mut buf| {
             buf.put_u8(consts::SSH_MSG_USERAUTH_REQUEST);
             put_ssh_string(&mut buf, username.as_ref());
             put_ssh_string(&mut buf, service_name.as_ref());
@@ -155,13 +153,11 @@ impl Userauth {
     pub fn poll_authenticate<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-        transport: &mut T,
+        mut transport: Pin<&mut T>,
     ) -> Poll<Result<AuthResult, crate::Error>>
     where
-        T: Transport + Unpin,
+        T: Transport,
     {
-        let mut transport = Pin::new(transport);
-
         loop {
             match self.state {
                 AuthState::Init | AuthState::ServiceRequest => {

@@ -10,7 +10,6 @@ use crate::{
 };
 use bytes::{buf::UninitSlice, Buf, BufMut, Bytes, BytesMut};
 use futures::{
-    future::poll_fn,
     ready,
     task::{self, Poll},
 };
@@ -81,15 +80,19 @@ mod sealed {
 
 // ==== DefaultTransport ====
 
-/// The object that drives SSH transport layer.
-pub struct DefaultTransport<T> {
-    stream: T,
-    state: TransportState,
-    send: SendPacket,
-    recv: RecvPacket,
-    kex: KeyExchange,
-    session_id: Option<digest::Digest>,
-    rng: rand::SystemRandom,
+pin_project! {
+    #[project = DefaultTransportProj]
+    /// The object that drives SSH transport layer.
+    pub struct DefaultTransport<T> {
+        #[pin]
+        stream: T,
+        state: TransportState,
+        send: SendPacket,
+        recv: RecvPacket,
+        kex: KeyExchange,
+        session_id: Option<digest::Digest>,
+        rng: rand::SystemRandom,
+    }
 }
 
 enum TransportState {
@@ -113,11 +116,11 @@ enum TransportState {
 
 impl<T> DefaultTransport<T>
 where
-    T: AsyncRead + AsyncWrite + Unpin,
+    T: AsyncRead + AsyncWrite,
 {
     /// Create a new `Transport` with the specified I/O object.
-    pub async fn establish(stream: T) -> Result<Self, crate::Error> {
-        let mut me = Self {
+    pub fn new(stream: T) -> Self {
+        Self {
             stream,
             state: TransportState::Init,
             send: SendPacket::new(0x10000),
@@ -125,9 +128,7 @@ where
             kex: KeyExchange::default(),
             session_id: None,
             rng: rand::SystemRandom::new(),
-        };
-        poll_fn(|cx| me.poll_handshake(cx)).await?;
-        Ok(me)
+        }
     }
 
     /// Return a reference to underlying I/O object.
@@ -138,10 +139,32 @@ where
 
     /// Return a mutable reference to underlying I/O object.
     #[inline]
-    pub fn get_mut(&mut self) -> &mut T {
+    pub fn get_mut(&mut self) -> &mut T
+    where
+        T: Unpin,
+    {
         &mut self.stream
     }
 
+    /// Return a pinned reference to underlying I/O object.
+    #[inline]
+    pub fn get_pin_mut(self: Pin<&mut Self>) -> Pin<&mut T> {
+        self.project().stream
+    }
+
+    #[inline]
+    pub fn poll_handshake(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), crate::Error>> {
+        self.project().poll_handshake(cx)
+    }
+}
+
+impl<T> DefaultTransportProj<'_, T>
+where
+    T: AsyncRead + AsyncWrite,
+{
     fn poll_handshake(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
         let span = tracing::trace_span!("Transport::poll_handshake");
         let _enter = span.enter();
@@ -150,7 +173,7 @@ where
             match self.state {
                 TransportState::Init => {
                     tracing::trace!("--> Init");
-                    self.state = TransportState::WriteClientSshId {
+                    *self.state = TransportState::WriteClientSshId {
                         line: {
                             let mut line = CLIENT_SSH_ID.to_owned();
                             line.put_slice(b"\r\n");
@@ -176,7 +199,7 @@ where
                         *written += amt;
                     }
 
-                    self.state = TransportState::FlushClientSshId;
+                    *self.state = TransportState::FlushClientSshId;
                 }
 
                 TransportState::FlushClientSshId => {
@@ -185,7 +208,7 @@ where
                     let mut stream = Pin::new(&mut self.stream);
                     ready!(stream.as_mut().poll_flush(cx)).map_err(crate::Error::io)?;
 
-                    self.state = TransportState::ReadServerSshId {
+                    *self.state = TransportState::ReadServerSshId {
                         buf: BytesMut::with_capacity(256), // TODO: choose appropriate buffer size
                     };
                 }
@@ -243,7 +266,7 @@ where
                     tracing::trace!("--> server_id = {:?}", String::from_utf8_lossy(&server_id));
 
                     self.kex.server_id = server_id.to_vec();
-                    self.state = TransportState::WaitingServerKexInit {
+                    *self.state = TransportState::WaitingServerKexInit {
                         recv_buf: vec![0u8; 0x10000].into_boxed_slice(),
                         remains: Some(remains),
                     };
@@ -257,10 +280,10 @@ where
 
                     let range = ready!(self.recv.poll_recv(
                         cx,
-                        &mut Rewind {
-                            stream: &mut self.stream,
+                        Pin::new(&mut Rewind {
+                            stream: self.stream.as_mut(),
                             remains,
-                        },
+                        }),
                         recv_buf
                     ))?;
                     debug_assert!(remains.as_ref().map_or(true, |buf| buf.is_empty()));
@@ -270,13 +293,13 @@ where
                     match peek_u8(&payload) {
                         Some(consts::SSH_MSG_DISCONNECT) => {
                             // TODO: parse disconnect message
-                            self.state = TransportState::Disconnected;
+                            *self.state = TransportState::Disconnected;
                         }
 
                         Some(consts::SSH_MSG_KEXINIT) => {
                             tracing::trace!("--> KEXINIT");
                             self.kex.start(&mut payload, &self.rng)?;
-                            self.state = TransportState::Kex;
+                            *self.state = TransportState::Kex;
                         }
 
                         Some(typ) => {
@@ -301,6 +324,31 @@ where
         }
     }
 
+    fn poll_kex(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
+        assert!(
+            matches!(self.state, TransportState::Kex),
+            "unexpected condition"
+        );
+
+        let (opening_key, sealing_key, exchange_hash) = ready!(self.kex.poll_complete(
+            cx,
+            self.stream.as_mut(),
+            &mut self.send,
+            &mut self.recv,
+            self.session_id.as_ref(),
+        ))?;
+
+        self.recv.key = OpeningKey::Chacha20Poly1305(opening_key);
+        self.send.key = SealingKey::Chacha20Poly1305(sealing_key);
+
+        // The first exchange hash is used as 'session id'.
+        self.session_id.get_or_insert(exchange_hash);
+
+        *self.state = TransportState::Ready;
+
+        Poll::Ready(Ok(()))
+    }
+
     fn poll_recv_inner(
         &mut self,
         cx: &mut task::Context<'_>,
@@ -322,13 +370,13 @@ where
                 TransportState::Ready => {
                     tracing::trace!("--> Ready");
 
-                    let range = ready!(self.recv.poll_recv(cx, &mut self.stream, recv_buf))?;
+                    let range = ready!(self.recv.poll_recv(cx, self.stream.as_mut(), recv_buf))?;
                     let mut payload = &recv_buf[range.clone()];
 
                     match peek_u8(&payload) {
                         Some(consts::SSH_MSG_DISCONNECT) => {
                             // TODO: parse disconnect message
-                            self.state = TransportState::Disconnected;
+                            *self.state = TransportState::Disconnected;
                         }
 
                         Some(consts::SSH_MSG_IGNORE) => { /* ignore silently */ }
@@ -341,7 +389,7 @@ where
                         Some(consts::SSH_MSG_KEXINIT) => {
                             tracing::trace!("--> KEXINIT");
                             self.kex.start(&mut payload, &self.rng)?;
-                            self.state = TransportState::Kex;
+                            *self.state = TransportState::Kex;
                         }
 
                         Some(typ) => {
@@ -365,64 +413,12 @@ where
         }
     }
 
-    fn poll_kex(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
-        assert!(
-            matches!(self.state, TransportState::Kex),
-            "unexpected condition"
-        );
-
-        let (opening_key, sealing_key, exchange_hash) = ready!(self.kex.poll_complete(
-            cx,
-            &mut self.stream,
-            &mut self.send,
-            &mut self.recv,
-            self.session_id.as_ref(),
-        ))?;
-
-        self.recv.key = OpeningKey::Chacha20Poly1305(opening_key);
-        self.send.key = SealingKey::Chacha20Poly1305(sealing_key);
-
-        // The first exchange hash is used as 'session id'.
-        self.session_id.get_or_insert(exchange_hash);
-
-        self.state = TransportState::Ready;
-
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl<T> sealed::Sealed for DefaultTransport<T> where T: AsyncRead + AsyncWrite + Unpin {}
-
-impl<T> Transport for DefaultTransport<T>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    #[inline]
-    fn session_id(&self) -> &[u8] {
-        self.session_id.as_ref().unwrap().as_ref()
-    }
-
-    #[inline]
-    fn poll_recv<'a>(
-        mut self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-        recv_buf: &'a mut [u8],
-    ) -> Poll<Result<&'a [u8], crate::Error>> {
-        self.poll_recv_inner(cx, recv_buf)
-            .map_ok(move |range| &recv_buf[range])
-    }
-
-    /// Wait for a new packet is avilable to send.
-    fn poll_send_ready(
-        self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-    ) -> Poll<Result<(), crate::Error>> {
+    fn poll_send_ready(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
         let span = tracing::trace_span!("Transport::poll_send");
         let _enter = span.enter();
 
-        let me = self.get_mut();
         loop {
-            match me.state {
+            match self.state {
                 TransportState::Init
                 | TransportState::WriteClientSshId { .. }
                 | TransportState::FlushClientSshId
@@ -433,12 +429,12 @@ where
 
                 TransportState::Kex => {
                     tracing::trace!("--> Kex");
-                    ready!(me.poll_kex(cx))?;
+                    ready!(self.poll_kex(cx))?;
                 }
 
                 TransportState::Ready => {
                     tracing::trace!("--> Ready");
-                    ready!(me.send.poll_flush(cx, &mut me.stream))?;
+                    ready!(self.send.poll_flush(cx, self.stream.as_mut()))?;
                     return Poll::Ready(Ok(()));
                 }
 
@@ -448,8 +444,40 @@ where
             }
         }
     }
+}
 
-    fn send<F>(mut self: Pin<&mut Self>, payload: F) -> Result<(), crate::Error>
+impl<T> sealed::Sealed for DefaultTransport<T> where T: AsyncRead + AsyncWrite {}
+
+impl<T> Transport for DefaultTransport<T>
+where
+    T: AsyncRead + AsyncWrite,
+{
+    #[inline]
+    fn session_id(&self) -> &[u8] {
+        self.session_id.as_ref().unwrap().as_ref()
+    }
+
+    #[inline]
+    fn poll_recv<'a>(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        recv_buf: &'a mut [u8],
+    ) -> Poll<Result<&'a [u8], crate::Error>> {
+        self.project()
+            .poll_recv_inner(cx, recv_buf)
+            .map_ok(move |range| &recv_buf[range])
+    }
+
+    /// Wait for a new packet is avilable to send.
+    #[inline]
+    fn poll_send_ready(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), crate::Error>> {
+        self.project().poll_send_ready(cx)
+    }
+
+    fn send<F>(self: Pin<&mut Self>, payload: F) -> Result<(), crate::Error>
     where
         F: FnOnce(&mut dyn BufMut),
     {
@@ -461,7 +489,8 @@ where
             "transport is not ready to send"
         );
 
-        self.send.fill_buf(payload)?;
+        let me = self.project();
+        me.send.fill_buf(payload)?;
 
         Ok(())
     }
@@ -471,8 +500,8 @@ where
         self: Pin<&mut Self>,
         cx: &mut task::Context<'_>,
     ) -> Poll<Result<(), crate::Error>> {
-        let me = self.get_mut();
-        me.send.poll_flush(cx, &mut me.stream)
+        let mut me = self.project();
+        me.send.poll_flush(cx, me.stream.as_mut())
     }
 }
 
@@ -597,12 +626,11 @@ impl SendPacket {
     fn poll_flush<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-        stream: &mut T,
+        mut stream: Pin<&mut T>,
     ) -> Poll<Result<(), crate::Error>>
     where
-        T: AsyncWrite + Unpin,
+        T: AsyncWrite,
     {
-        let mut stream = Pin::new(stream);
         loop {
             match self.state {
                 SendPacketState::Available => {
@@ -707,16 +735,15 @@ impl RecvPacket {
     fn poll_recv<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-        stream: &mut T,
+        mut stream: Pin<&mut T>,
         buf: &mut [u8],
     ) -> Poll<Result<Range<usize>, crate::Error>>
     where
-        T: AsyncRead + Unpin,
+        T: AsyncRead,
     {
         let span = tracing::trace_span!("RecvPacket::poll_recv");
         let _enter = span.enter();
 
-        let mut stream = Pin::new(stream);
         loop {
             match self.state {
                 RecvPacketState::Ready => {
@@ -910,13 +937,13 @@ impl KeyExchange {
     fn poll_complete<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-        stream: &mut T,
+        mut stream: Pin<&mut T>,
         send: &mut SendPacket,
         recv: &mut RecvPacket,
         session_id: Option<&digest::Digest>,
     ) -> Poll<Result<(aead::OpeningKey, aead::SealingKey, digest::Digest), crate::Error>>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        T: AsyncRead + AsyncWrite,
     {
         let span = tracing::trace_span!("KeyExchange::poll_complete_kex");
         let _enter = span.enter();
@@ -926,7 +953,7 @@ impl KeyExchange {
                 KeyExchangeState::SendingClientKexInit => {
                     tracing::trace!("--> SendingClientKexInit");
 
-                    ready!(send.poll_flush(cx, stream))?;
+                    ready!(send.poll_flush(cx, stream.as_mut()))?;
                     send.fill_buf(|buf| {
                         buf.put_slice(&self.client_kexinit_payload[..]);
                     })?;
@@ -936,7 +963,7 @@ impl KeyExchange {
                 KeyExchangeState::SendingEcdhInit => {
                     tracing::trace!("--> SendingEcdhInit");
 
-                    ready!(send.poll_flush(cx, stream))?;
+                    ready!(send.poll_flush(cx, stream.as_mut()))?;
 
                     let client_public_key = self.client_public_key();
                     send.fill_buf(|mut buf| {
@@ -950,9 +977,9 @@ impl KeyExchange {
                 KeyExchangeState::ReceivingEcdhReply => {
                     tracing::trace!("--> ReceivingEcdhReply");
 
-                    ready!(send.poll_flush(cx, stream))?;
+                    ready!(send.poll_flush(cx, stream.as_mut()))?;
 
-                    let range = ready!(recv.poll_recv(cx, stream, &mut self.recv_buf))?;
+                    let range = ready!(recv.poll_recv(cx, stream.as_mut(), &mut self.recv_buf))?;
                     let mut payload = &self.recv_buf[range];
 
                     let mut digest = self.digest.take().unwrap();
@@ -1073,7 +1100,7 @@ impl KeyExchange {
                 KeyExchangeState::SendingClientNewKeys => {
                     tracing::trace!("--> SendingClientNewKeys");
 
-                    ready!(send.poll_flush(cx, stream))?;
+                    ready!(send.poll_flush(cx, stream.as_mut()))?;
 
                     send.fill_buf(|buf| {
                         buf.put_u8(consts::SSH_MSG_NEWKEYS);
@@ -1085,9 +1112,9 @@ impl KeyExchange {
                 KeyExchangeState::ReceivingServerNewKeys => {
                     tracing::trace!("--> ReceivingServerNewKeys");
 
-                    ready!(send.poll_flush(cx, stream))?;
+                    ready!(send.poll_flush(cx, stream.as_mut()))?;
 
-                    let range = ready!(recv.poll_recv(cx, stream, &mut self.recv_buf))?;
+                    let range = ready!(recv.poll_recv(cx, stream.as_mut(), &mut self.recv_buf))?;
                     let mut payload = &self.recv_buf[range];
 
                     if payload.get_u8() != consts::SSH_MSG_NEWKEYS {

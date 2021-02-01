@@ -40,13 +40,16 @@ impl Connection {
     }
 
     /// Request to open a session channel.
-    pub fn channel_open_session<T>(&mut self, transport: &mut T) -> Result<ChannelId, crate::Error>
+    pub fn channel_open_session<T>(
+        &mut self,
+        transport: Pin<&mut T>,
+    ) -> Result<ChannelId, crate::Error>
     where
-        T: Transport + Unpin,
+        T: Transport,
     {
         let sender_channel = self.allocate_channel();
 
-        Pin::new(transport).send(|mut buf| {
+        transport.send(|mut buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_OPEN);
             put_ssh_string(&mut buf, b"session");
             buf.put_u32(sender_channel.0);
@@ -83,19 +86,19 @@ impl Connection {
 
     pub fn channel_request_exec<T>(
         &mut self,
-        transport: &mut T,
+        transport: Pin<&mut T>,
         channel: ChannelId,
         command: &str,
     ) -> Result<(), crate::Error>
     where
-        T: Transport + Unpin,
+        T: Transport,
     {
         let channel = self
             .channels
             .get_mut(&channel)
             .ok_or_else(|| crate::Error::connection("invalid channel id"))?;
 
-        Pin::new(transport).send(|mut buf| {
+        transport.send(|mut buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_REQUEST);
             buf.put_u32(channel.recipient_id.0);
             put_ssh_string(&mut buf, b"exec");
@@ -110,18 +113,18 @@ impl Connection {
 
     pub fn channel_close<T>(
         &mut self,
-        transport: &mut T,
+        transport: Pin<&mut T>,
         channel: ChannelId,
     ) -> Result<(), crate::Error>
     where
-        T: Transport + Unpin,
+        T: Transport,
     {
         let channel = match self.channels.get_mut(&channel) {
             Some(ch) => ch,
             None => return Ok(()), // do nothing
         };
 
-        Pin::new(transport).send(|buf| {
+        transport.send(|buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_CLOSE);
             buf.put_u32(channel.recipient_id.0);
         })?;
@@ -133,19 +136,19 @@ impl Connection {
 
     pub fn window_adjust<T>(
         &mut self,
-        transport: &mut T,
+        transport: Pin<&mut T>,
         channel: ChannelId,
         additional: u32,
     ) -> Result<(), crate::Error>
     where
-        T: Transport + Unpin,
+        T: Transport,
     {
         let channel = self
             .channels
             .get_mut(&channel)
             .ok_or_else(|| crate::Error::connection("invalid channel id"))?;
 
-        Pin::new(transport).send(|buf| {
+        transport.send(|buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_WINDOW_ADJUST);
             buf.put_u32(channel.recipient_id.0);
             buf.put_u32(additional);
@@ -159,13 +162,11 @@ impl Connection {
     pub fn poll_recv<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-        transport: &mut T,
+        mut transport: Pin<&mut T>,
     ) -> Poll<Result<Response, crate::Error>>
     where
-        T: Transport + Unpin,
+        T: Transport,
     {
-        let mut transport = Pin::new(transport);
-
         ready!(transport.as_mut().poll_flush(cx))?;
 
         loop {
