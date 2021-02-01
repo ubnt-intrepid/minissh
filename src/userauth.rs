@@ -14,8 +14,7 @@ use futures::{
     ready,
     task::{self, Poll},
 };
-use std::collections::VecDeque;
-use tokio::io::{AsyncRead, AsyncWrite};
+use std::{collections::VecDeque, pin::Pin};
 
 /// The object that manages authentication state during a SSH session.
 pub struct Userauth {
@@ -50,16 +49,18 @@ impl Userauth {
     pub fn poll_service_request<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-        transport: &mut Transport<T>,
+        transport: &mut T,
     ) -> Poll<Result<(), crate::Error>>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        T: Transport + Unpin,
     {
+        let mut transport = Pin::new(transport);
+
         loop {
             match self.state {
                 AuthState::Init => {
-                    ready!(transport.poll_send_ready(cx))?;
-                    transport.send(|buf| {
+                    ready!(transport.as_mut().poll_send_ready(cx))?;
+                    transport.as_mut().send(|buf| {
                         buf.put_slice(b"\x05\x00\x00\x00\x0Cssh-userauth");
                     })?;
 
@@ -67,8 +68,8 @@ impl Userauth {
                 }
 
                 AuthState::ServiceRequest => {
-                    ready!(transport.poll_flush(cx))?;
-                    let mut payload = ready!(transport.poll_recv(cx, &mut self.recv_buf))?;
+                    ready!(transport.as_mut().poll_flush(cx))?;
+                    let mut payload = ready!(transport.as_mut().poll_recv(cx, &mut self.recv_buf))?;
 
                     let typ = payload.get_u8();
                     if typ != consts::SSH_MSG_SERVICE_ACCEPT {
@@ -94,17 +95,17 @@ impl Userauth {
     /// Send an user authentication request.
     pub fn send_userauth<T>(
         &mut self,
-        transport: &mut Transport<T>,
+        transport: &mut T,
         username: &str,
         service_name: &str,
         method: AuthMethod<'_>,
     ) -> Result<(), crate::Error>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        T: Transport + Unpin,
     {
         assert!(matches!(self.state, AuthState::AuthRequests));
 
-        transport.send(|mut buf| {
+        Pin::new(transport).send(|mut buf| {
             buf.put_u8(consts::SSH_MSG_USERAUTH_REQUEST);
             put_ssh_string(&mut buf, username.as_ref());
             put_ssh_string(&mut buf, service_name.as_ref());
@@ -154,11 +155,13 @@ impl Userauth {
     pub fn poll_authenticate<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-        transport: &mut Transport<T>,
+        transport: &mut T,
     ) -> Poll<Result<AuthResult, crate::Error>>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        T: Transport + Unpin,
     {
+        let mut transport = Pin::new(transport);
+
         loop {
             match self.state {
                 AuthState::Init | AuthState::ServiceRequest => {
@@ -170,8 +173,8 @@ impl Userauth {
                 }
 
                 AuthState::AuthRequests => {
-                    ready!(transport.poll_flush(cx))?;
-                    let mut payload = ready!(transport.poll_recv(cx, &mut self.recv_buf))?;
+                    ready!(transport.as_mut().poll_flush(cx))?;
+                    let mut payload = ready!(transport.as_mut().poll_recv(cx, &mut self.recv_buf))?;
 
                     let typ = payload.get_u8();
                     match typ {

@@ -10,6 +10,7 @@ use crate::{
 };
 use bytes::{buf::UninitSlice, Buf, BufMut, Bytes, BytesMut};
 use futures::{
+    future::poll_fn,
     ready,
     task::{self, Poll},
 };
@@ -26,10 +27,62 @@ const CHACHA20_POLY1305: &str = "chacha20-poly1305@openssh.com";
 
 const CLIENT_SSH_ID: &[u8] = concat!("SSH-2.0-minissh_", env!("CARGO_PKG_VERSION")).as_bytes();
 
-// ==== Transport ====
+/// A trait that abstracts SSH transport layer.
+pub trait Transport: sealed::Sealed {
+    /// Return the session identifier for this connection.
+    ///
+    /// This value is typically used by the upper layer, such as public key based user authentication.
+    fn session_id(&self) -> &[u8];
+
+    /// Receive a packet from the peer.
+    ///
+    /// `recv_buf` is used for reading the cipher text and decrypting,
+    /// and must have enough capacity for storing intermediate data.
+    /// After decryption, the payload part is returned as a sub slice of
+    /// `recv_buf`.
+    ///
+    /// Several packet types, such as key exchange negotiation, are filtered out
+    /// and handle by the transport.
+    fn poll_recv<'a>(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        recv_buf: &'a mut [u8],
+    ) -> Poll<Result<&'a [u8], crate::Error>>;
+
+    /// Wait for a new packet is avilable to send.
+    fn poll_send_ready(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), crate::Error>>;
+
+    /// Append a packet to the send buffer.
+    ///
+    /// This function should be called after `poll_send_ready` returns `Poll::Ready(Ok(()))`.
+    ///
+    /// Note that the packet added by this function will not write to the server before calling
+    /// `poll_flush` or `poll_send_ready`.
+    fn send<F>(self: Pin<&mut Self>, payload: F) -> Result<(), crate::Error>
+    where
+        F: FnOnce(&mut dyn BufMut);
+
+    /// Flush the internal buffer to the I/O.
+    ///
+    /// Unlike `poll_send_ready`, this function does not progress the internal key exchange
+    /// process and immediately returns after the buffer is flushed.
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), crate::Error>>;
+}
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+// ==== DefaultTransport ====
 
 /// The object that drives SSH transport layer.
-pub struct Transport<T> {
+pub struct DefaultTransport<T> {
     stream: T,
     state: TransportState,
     send: SendPacket,
@@ -58,13 +111,13 @@ enum TransportState {
     Disconnected,
 }
 
-impl<T> Transport<T>
+impl<T> DefaultTransport<T>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     /// Create a new `Transport` with the specified I/O object.
-    pub fn new(stream: T) -> Self {
-        Self {
+    pub async fn establish(stream: T) -> Result<Self, crate::Error> {
+        let mut me = Self {
             stream,
             state: TransportState::Init,
             send: SendPacket::new(0x10000),
@@ -72,7 +125,9 @@ where
             kex: KeyExchange::default(),
             session_id: None,
             rng: rand::SystemRandom::new(),
-        }
+        };
+        poll_fn(|cx| me.poll_handshake(cx)).await?;
+        Ok(me)
     }
 
     /// Return a reference to underlying I/O object.
@@ -87,11 +142,7 @@ where
         &mut self.stream
     }
 
-    /// Run the first key exchange negotiation and set up the encrypted connection to the server.
-    ///
-    /// This function must be called after creating the instance, and completed before
-    /// any other operations, such as `poll_recv` are called.
-    pub fn poll_handshake(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
+    fn poll_handshake(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
         let span = tracing::trace_span!("Transport::poll_handshake");
         let _enter = span.enter();
 
@@ -250,25 +301,6 @@ where
         }
     }
 
-    /// Receive a packet from the peer.
-    ///
-    /// `recv_buf` is used for reading the cipher text and decrypting,
-    /// and must have enough capacity for storing intermediate data.
-    /// After decryption, the payload part is returned as a sub slice of
-    /// `recv_buf`.
-    ///
-    /// Several packet types, such as key exchange negotiation, are filtered out
-    /// and handle by the transport.
-    #[inline]
-    pub fn poll_recv<'a>(
-        &mut self,
-        cx: &mut task::Context<'_>,
-        recv_buf: &'a mut [u8],
-    ) -> Poll<Result<&'a [u8], crate::Error>> {
-        self.poll_recv_inner(cx, recv_buf)
-            .map_ok(move |range| &recv_buf[range])
-    }
-
     fn poll_recv_inner(
         &mut self,
         cx: &mut task::Context<'_>,
@@ -333,74 +365,6 @@ where
         }
     }
 
-    /// Wait for a new packet is avilable to send.
-    pub fn poll_send_ready(
-        &mut self,
-        cx: &mut task::Context<'_>,
-    ) -> Poll<Result<(), crate::Error>> {
-        let span = tracing::trace_span!("Transport::poll_send");
-        let _enter = span.enter();
-
-        loop {
-            match self.state {
-                TransportState::Init
-                | TransportState::WriteClientSshId { .. }
-                | TransportState::FlushClientSshId
-                | TransportState::ReadServerSshId { .. }
-                | TransportState::WaitingServerKexInit { .. } => {
-                    panic!("called before poll_handshake() completed")
-                }
-
-                TransportState::Kex => {
-                    tracing::trace!("--> Kex");
-                    ready!(self.poll_kex(cx))?;
-                }
-
-                TransportState::Ready => {
-                    tracing::trace!("--> Ready");
-                    ready!(self.send.poll_flush(cx, &mut self.stream))?;
-                    return Poll::Ready(Ok(()));
-                }
-
-                TransportState::Disconnected => {
-                    return Poll::Ready(Err(crate::Error::transport("disconnected")));
-                }
-            }
-        }
-    }
-
-    /// Append a packet to the send buffer.
-    ///
-    /// This function should be called after `poll_send_ready` returns `Poll::Ready(Ok(()))`.
-    ///
-    /// Note that the packet added by this function will not write to the server before calling
-    /// `poll_flush` or `poll_send_ready`.
-    pub fn send<F>(&mut self, payload: F) -> Result<(), crate::Error>
-    where
-        F: FnOnce(&mut dyn BufMut),
-    {
-        let span = tracing::trace_span!("Transport::send");
-        let _enter = span.enter();
-
-        assert!(
-            matches!(self.state, TransportState::Ready),
-            "transport is not ready to send"
-        );
-
-        self.send.fill_buf(payload)?;
-
-        Ok(())
-    }
-
-    /// Flush the internal buffer to the I/O.
-    ///
-    /// Unlike `poll_send_ready`, this function does not progress the internal key exchange
-    /// process and immediately returns after the buffer is flushed.
-    #[inline]
-    pub fn poll_flush(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
-        self.send.poll_flush(cx, &mut self.stream)
-    }
-
     fn poll_kex(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
         assert!(
             matches!(self.state, TransportState::Kex),
@@ -425,9 +389,90 @@ where
 
         Poll::Ready(Ok(()))
     }
+}
 
-    pub(crate) fn session_id(&self) -> &digest::Digest {
-        self.session_id.as_ref().unwrap()
+impl<T> sealed::Sealed for DefaultTransport<T> where T: AsyncRead + AsyncWrite + Unpin {}
+
+impl<T> Transport for DefaultTransport<T>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    #[inline]
+    fn session_id(&self) -> &[u8] {
+        self.session_id.as_ref().unwrap().as_ref()
+    }
+
+    #[inline]
+    fn poll_recv<'a>(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        recv_buf: &'a mut [u8],
+    ) -> Poll<Result<&'a [u8], crate::Error>> {
+        self.poll_recv_inner(cx, recv_buf)
+            .map_ok(move |range| &recv_buf[range])
+    }
+
+    /// Wait for a new packet is avilable to send.
+    fn poll_send_ready(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), crate::Error>> {
+        let span = tracing::trace_span!("Transport::poll_send");
+        let _enter = span.enter();
+
+        let me = self.get_mut();
+        loop {
+            match me.state {
+                TransportState::Init
+                | TransportState::WriteClientSshId { .. }
+                | TransportState::FlushClientSshId
+                | TransportState::ReadServerSshId { .. }
+                | TransportState::WaitingServerKexInit { .. } => {
+                    panic!("called before poll_handshake() completed")
+                }
+
+                TransportState::Kex => {
+                    tracing::trace!("--> Kex");
+                    ready!(me.poll_kex(cx))?;
+                }
+
+                TransportState::Ready => {
+                    tracing::trace!("--> Ready");
+                    ready!(me.send.poll_flush(cx, &mut me.stream))?;
+                    return Poll::Ready(Ok(()));
+                }
+
+                TransportState::Disconnected => {
+                    return Poll::Ready(Err(crate::Error::transport("disconnected")));
+                }
+            }
+        }
+    }
+
+    fn send<F>(mut self: Pin<&mut Self>, payload: F) -> Result<(), crate::Error>
+    where
+        F: FnOnce(&mut dyn BufMut),
+    {
+        let span = tracing::trace_span!("Transport::send");
+        let _enter = span.enter();
+
+        assert!(
+            matches!(self.state, TransportState::Ready),
+            "transport is not ready to send"
+        );
+
+        self.send.fill_buf(payload)?;
+
+        Ok(())
+    }
+
+    #[inline]
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), crate::Error>> {
+        let me = self.get_mut();
+        me.send.poll_flush(cx, &mut me.stream)
     }
 }
 

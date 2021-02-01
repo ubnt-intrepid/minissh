@@ -3,13 +3,12 @@ use crate::{
     transport::Transport,
     util::{get_ssh_string, put_ssh_string},
 };
-use bytes::{Buf, BufMut, Bytes};
+use bytes::{Buf, Bytes};
 use futures::{
     ready,
     task::{self, Poll},
 };
-use std::{cmp, collections::HashMap, num};
-use tokio::io::{AsyncRead, AsyncWrite};
+use std::{cmp, collections::HashMap, num, pin::Pin};
 
 pub struct Connection {
     initial_window_size: u32,
@@ -41,16 +40,13 @@ impl Connection {
     }
 
     /// Request to open a session channel.
-    pub fn channel_open_session<T>(
-        &mut self,
-        transport: &mut Transport<T>,
-    ) -> Result<ChannelId, crate::Error>
+    pub fn channel_open_session<T>(&mut self, transport: &mut T) -> Result<ChannelId, crate::Error>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        T: Transport + Unpin,
     {
         let sender_channel = self.allocate_channel();
 
-        transport.send(|mut buf| {
+        Pin::new(transport).send(|mut buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_OPEN);
             put_ssh_string(&mut buf, b"session");
             buf.put_u32(sender_channel.0);
@@ -87,19 +83,19 @@ impl Connection {
 
     pub fn channel_request_exec<T>(
         &mut self,
-        transport: &mut Transport<T>,
+        transport: &mut T,
         channel: ChannelId,
         command: &str,
     ) -> Result<(), crate::Error>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        T: Transport + Unpin,
     {
         let channel = self
             .channels
             .get_mut(&channel)
             .ok_or_else(|| crate::Error::connection("invalid channel id"))?;
 
-        transport.send(|mut buf| {
+        Pin::new(transport).send(|mut buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_REQUEST);
             buf.put_u32(channel.recipient_id.0);
             put_ssh_string(&mut buf, b"exec");
@@ -114,18 +110,18 @@ impl Connection {
 
     pub fn channel_close<T>(
         &mut self,
-        transport: &mut Transport<T>,
+        transport: &mut T,
         channel: ChannelId,
     ) -> Result<(), crate::Error>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        T: Transport + Unpin,
     {
         let channel = match self.channels.get_mut(&channel) {
             Some(ch) => ch,
             None => return Ok(()), // do nothing
         };
 
-        transport.send(|buf| {
+        Pin::new(transport).send(|buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_CLOSE);
             buf.put_u32(channel.recipient_id.0);
         })?;
@@ -137,19 +133,19 @@ impl Connection {
 
     pub fn window_adjust<T>(
         &mut self,
-        transport: &mut Transport<T>,
+        transport: &mut T,
         channel: ChannelId,
         additional: u32,
     ) -> Result<(), crate::Error>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        T: Transport + Unpin,
     {
         let channel = self
             .channels
             .get_mut(&channel)
             .ok_or_else(|| crate::Error::connection("invalid channel id"))?;
 
-        transport.send(|buf| {
+        Pin::new(transport).send(|buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_WINDOW_ADJUST);
             buf.put_u32(channel.recipient_id.0);
             buf.put_u32(additional);
@@ -163,15 +159,17 @@ impl Connection {
     pub fn poll_recv<T>(
         &mut self,
         cx: &mut task::Context<'_>,
-        transport: &mut Transport<T>,
+        transport: &mut T,
     ) -> Poll<Result<Response, crate::Error>>
     where
-        T: AsyncRead + AsyncWrite + Unpin,
+        T: Transport + Unpin,
     {
-        ready!(transport.poll_flush(cx))?;
+        let mut transport = Pin::new(transport);
+
+        ready!(transport.as_mut().poll_flush(cx))?;
 
         loop {
-            let mut payload = ready!(transport.poll_recv(cx, &mut self.recv_buf))?;
+            let mut payload = ready!(transport.as_mut().poll_recv(cx, &mut self.recv_buf))?;
             tracing::trace!("Handle incoming message");
             match payload.get_u8() {
                 // Global request described in https://tools.ietf.org/html/rfc4254#section-4

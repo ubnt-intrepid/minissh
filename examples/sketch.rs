@@ -2,29 +2,26 @@ use anyhow::Result;
 use futures::{future::poll_fn, ready};
 use minissh::{
     connection::Connection,
-    transport::Transport,
+    transport::{DefaultTransport, Transport},
     userauth::{AuthMethod, AuthResult, Userauth},
 };
-use std::net::SocketAddr;
+use std::pin::Pin;
 use tokio::net::TcpStream;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let addr = SocketAddr::from(([192, 168, 122, 10], 22));
-
-    tracing::debug!("establish SSH transport (addr = {})", addr);
-    let stream = TcpStream::connect(&addr).await?;
-    let mut transport = Transport::new(stream);
-    poll_fn(|cx| transport.poll_handshake(cx)).await?;
+    tracing::debug!("transport");
+    let stream = TcpStream::connect("127.0.0.1:22").await?;
+    let mut transport = DefaultTransport::establish(stream).await?;
 
     tracing::debug!("userauth");
     let mut userauth = Userauth::default();
     poll_fn(|cx| userauth.poll_service_request(cx, &mut transport)).await?;
 
     poll_fn(|cx| {
-        ready!(transport.poll_send_ready(cx))?;
+        ready!(Pin::new(&mut transport).poll_send_ready(cx))?;
         userauth
             .send_userauth(
                 &mut transport,
@@ -76,7 +73,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    poll_fn(|cx| transport.poll_flush(cx)).await?;
+    poll_fn(|cx| Pin::new(&mut transport).poll_flush(cx)).await?;
     conn.channel_request_exec(&mut transport, channel, "pwd")?;
     conn.window_adjust(&mut transport, channel, 1024 * 8)?;
     loop {
