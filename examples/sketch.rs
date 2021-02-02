@@ -1,9 +1,9 @@
 use anyhow::Result;
-use futures::{future::poll_fn, ready};
+use futures::future::poll_fn;
 use minissh::{
     connection::Connection,
     transport::{DefaultTransport, Transport},
-    userauth::{AuthMethod, AuthResult, Userauth},
+    userauth::Userauth,
 };
 use tokio::net::TcpStream;
 
@@ -20,39 +20,18 @@ async fn main() -> Result<()> {
 
     tracing::debug!("userauth");
     let mut userauth = Userauth::default();
-    poll_fn(|cx| userauth.poll_service_request(cx, transport.as_mut())).await?;
-
+    let auth_method = minissh::userauth::Password("devenv");
+    tokio::pin!(auth_method);
     poll_fn(|cx| {
-        ready!(transport.as_mut().poll_send_ready(cx))?;
-        userauth
-            .send_userauth(
-                transport.as_mut(),
-                "devenv",
-                "ssh-connection",
-                AuthMethod::Password {
-                    current: "devenv",
-                    new: None,
-                },
-            )
-            .into()
+        userauth.poll_authenticate(
+            cx,
+            transport.as_mut(),
+            "devenv",
+            "ssh-connection",
+            auth_method.as_mut(),
+        )
     })
     .await?;
-    loop {
-        let res = poll_fn(|cx| userauth.poll_authenticate(cx, transport.as_mut())).await?;
-        match res {
-            AuthResult::Success => {
-                tracing::debug!("--> success");
-                break;
-            }
-            AuthResult::Banner { message, .. } => {
-                tracing::debug!("--> banner(message = {:?})", std::str::from_utf8(&message));
-            }
-            AuthResult::Failure { .. } | AuthResult::PasswordChangeReq { .. } => {
-                anyhow::bail!("auth failed");
-            }
-            _ => unreachable!(),
-        }
-    }
 
     tracing::debug!("connection");
     let mut conn = Connection::default();

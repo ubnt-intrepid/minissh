@@ -46,253 +46,47 @@ impl Default for Userauth {
 }
 
 impl Userauth {
-    pub fn poll_service_request<T>(
+    /// Wait for the completion of authentication process.
+    pub fn poll_authenticate<T, A>(
         &mut self,
         cx: &mut task::Context<'_>,
-        mut transport: Pin<&mut T>,
+        transport: Pin<&mut T>,
+        username: &str,
+        service_name: &str,
+        method: Pin<&mut A>,
+    ) -> Poll<Result<(), crate::Error>>
+    where
+        T: Transport,
+        A: AuthMethod,
+    {
+        todo!()
+    }
+}
+
+pub trait AuthMethod {
+    fn poll_authenticate<T>(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        auth: Pin<&mut AuthContext<'_, T>>,
+    ) -> Poll<Result<(), crate::Error>>
+    where
+        T: Transport;
+}
+
+pub struct AuthContext<'a, T> {
+    _marker: std::marker::PhantomData<Pin<&'a mut T>>,
+}
+
+pub struct Password<'a>(pub &'a str);
+impl AuthMethod for Password<'_> {
+    fn poll_authenticate<T>(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        auth: Pin<&mut AuthContext<'_, T>>,
     ) -> Poll<Result<(), crate::Error>>
     where
         T: Transport,
     {
-        loop {
-            match self.state {
-                AuthState::Init => {
-                    ready!(transport.as_mut().poll_send_ready(cx))?;
-                    transport.as_mut().send(|buf| {
-                        buf.put_slice(b"\x05\x00\x00\x00\x0Cssh-userauth");
-                    })?;
-
-                    self.state = AuthState::ServiceRequest;
-                }
-
-                AuthState::ServiceRequest => {
-                    ready!(transport.as_mut().poll_flush(cx))?;
-                    let mut payload = ready!(transport.as_mut().poll_recv(cx, &mut self.recv_buf))?;
-
-                    let typ = payload.get_u8();
-                    if typ != consts::SSH_MSG_SERVICE_ACCEPT {
-                        return Err(crate::Error::userauth("incorrect reply")).into();
-                    }
-
-                    let service_name = get_ssh_string(&mut payload);
-                    if service_name != b"ssh-userauth" {
-                        return Err(crate::Error::userauth("incorrect service name")).into();
-                    }
-
-                    self.state = AuthState::AuthRequests;
-                    break;
-                }
-
-                AuthState::AuthRequests | AuthState::Authenticated => break,
-            }
-        }
-
-        Poll::Ready(Ok(()))
+        todo!()
     }
-
-    /// Send an user authentication request.
-    pub fn send_userauth<T>(
-        &mut self,
-        transport: Pin<&mut T>,
-        username: &str,
-        service_name: &str,
-        method: AuthMethod<'_>,
-    ) -> Result<(), crate::Error>
-    where
-        T: Transport,
-    {
-        assert!(matches!(self.state, AuthState::AuthRequests));
-
-        transport.send(|mut buf| {
-            buf.put_u8(consts::SSH_MSG_USERAUTH_REQUEST);
-            put_ssh_string(&mut buf, username.as_ref());
-            put_ssh_string(&mut buf, service_name.as_ref());
-            match method {
-                AuthMethod::PublicKey {
-                    algorithm,
-                    blob: key,
-                    signature,
-                } => {
-                    put_ssh_string(&mut buf, b"publickey"); // method name
-                    if let Some(signature) = signature {
-                        buf.put_u8(1);
-                        put_ssh_string(&mut buf, algorithm);
-                        put_ssh_string(&mut buf, key);
-                        put_ssh_string(&mut buf, signature);
-                        self.pending_auths.push_back(PendingAuth::PublicKey {
-                            has_signature: true,
-                        });
-                    } else {
-                        buf.put_u8(0);
-                        put_ssh_string(&mut buf, algorithm);
-                        put_ssh_string(&mut buf, key);
-                        self.pending_auths.push_back(PendingAuth::PublicKey {
-                            has_signature: false,
-                        });
-                    }
-                }
-
-                AuthMethod::Password { current, new } => {
-                    put_ssh_string(&mut buf, b"password"); // method name
-                    if let Some(new) = new {
-                        buf.put_u8(1);
-                        put_ssh_string(&mut buf, current.as_ref());
-                        put_ssh_string(&mut buf, new.as_ref());
-                    } else {
-                        buf.put_u8(0);
-                        put_ssh_string(&mut buf, current.as_ref());
-                    }
-                    self.pending_auths.push_back(PendingAuth::Password);
-                }
-            }
-        })?;
-        Ok(())
-    }
-
-    /// Wait for the completion of authentication process.
-    pub fn poll_authenticate<T>(
-        &mut self,
-        cx: &mut task::Context<'_>,
-        mut transport: Pin<&mut T>,
-    ) -> Poll<Result<AuthResult, crate::Error>>
-    where
-        T: Transport,
-    {
-        loop {
-            match self.state {
-                AuthState::Init | AuthState::ServiceRequest => {
-                    panic!("called before poll_service_request() complete");
-                }
-
-                AuthState::Authenticated => {
-                    return Poll::Ready(Ok(AuthResult::Success));
-                }
-
-                AuthState::AuthRequests => {
-                    ready!(transport.as_mut().poll_flush(cx))?;
-                    let mut payload = ready!(transport.as_mut().poll_recv(cx, &mut self.recv_buf))?;
-
-                    let typ = payload.get_u8();
-                    match typ {
-                        consts::SSH_MSG_USERAUTH_SUCCESS => {
-                            debug_assert!(!payload.has_remaining());
-
-                            let pending = self
-                                .pending_auths
-                                .pop_front()
-                                .expect("no authentication methods are requested");
-
-                            if let PendingAuth::PublicKey {
-                                has_signature: false,
-                            } = pending
-                            {
-                                tracing::warn!("publickey userauth succeeds without signature");
-                            }
-
-                            self.state = AuthState::Authenticated;
-                            self.pending_auths.clear();
-
-                            return Poll::Ready(Ok(AuthResult::Success));
-                        }
-
-                        consts::SSH_MSG_USERAUTH_FAILURE => {
-                            let _pending = self
-                                .pending_auths
-                                .pop_front()
-                                .expect("no authentication methods are requested");
-
-                            let continues = get_ssh_string(&mut payload);
-                            let partial_success = payload.get_u8();
-
-                            return Poll::Ready(Ok(AuthResult::Failure {
-                                continues,
-                                partial_success,
-                            }));
-                        }
-
-                        consts::SSH_MSG_USERAUTH_BANNER => {
-                            let message = get_ssh_string(&mut payload);
-                            let language_tag = get_ssh_string(&mut payload);
-                            return Poll::Ready(Ok(AuthResult::Banner {
-                                message,
-                                language_tag,
-                            }));
-                        }
-
-                        #[allow(unreachable_patterns)]
-                        consts::SSH_MSG_USERAUTH_PK_OK
-                        | consts::SSH_MSG_USERAUTH_PASSWD_CHANGEREQ => {
-                            let pending = self
-                                .pending_auths
-                                .pop_front()
-                                .expect("no authentication methods are requested");
-
-                            match pending {
-                                PendingAuth::PublicKey { .. } => {
-                                    let algorithm = get_ssh_string(&mut payload);
-                                    let blob = get_ssh_string(&mut payload);
-                                    return Poll::Ready(Ok(AuthResult::PublicKeyOk {
-                                        algorithm,
-                                        blob,
-                                    }));
-                                }
-
-                                PendingAuth::Password { .. } => {
-                                    let prompt = get_ssh_string(&mut payload);
-                                    let language_tag = get_ssh_string(&mut payload);
-                                    return Poll::Ready(Ok(AuthResult::PasswordChangeReq {
-                                        prompt,
-                                        language_tag,
-                                    }));
-                                }
-                            }
-                        }
-
-                        typ => {
-                            return Poll::Ready(Err(crate::Error::userauth(format!(
-                                "unsupported packet type: {}",
-                                typ
-                            ))));
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[non_exhaustive]
-pub enum AuthMethod<'a> {
-    PublicKey {
-        algorithm: &'a [u8],
-        blob: &'a [u8],
-        signature: Option<&'a [u8]>,
-    },
-
-    Password {
-        current: &'a str,
-        new: Option<&'a str>,
-    },
-}
-
-#[non_exhaustive]
-#[must_use]
-pub enum AuthResult {
-    Success,
-    Failure {
-        continues: Vec<u8>,
-        partial_success: u8,
-    },
-    Banner {
-        message: Vec<u8>,
-        language_tag: Vec<u8>,
-    },
-    PublicKeyOk {
-        algorithm: Vec<u8>,
-        blob: Vec<u8>,
-    },
-    PasswordChangeReq {
-        prompt: Vec<u8>,
-        language_tag: Vec<u8>,
-    },
 }
