@@ -49,13 +49,13 @@ impl Connection {
     {
         let sender_channel = self.allocate_channel();
 
-        transport.send(|mut buf| {
+        transport.start_send(&mut crate::transport::payload_fn(|mut buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_OPEN);
             put_ssh_string(&mut buf, b"session");
             buf.put_u32(sender_channel.0);
             buf.put_u32(self.initial_window_size);
             buf.put_u32(self.maximum_packet_size);
-        })?;
+        }))?;
 
         Ok(sender_channel)
     }
@@ -98,13 +98,13 @@ impl Connection {
             .get_mut(&channel)
             .ok_or_else(|| crate::Error::connection("invalid channel id"))?;
 
-        transport.send(|mut buf| {
+        transport.start_send(&mut crate::transport::payload_fn(|mut buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_REQUEST);
             buf.put_u32(channel.recipient_id.0);
             put_ssh_string(&mut buf, b"exec");
             buf.put_u8(0); // want_reply=FALSE
             put_ssh_string(&mut buf, command.as_ref());
-        })?;
+        }))?;
 
         // TODO: mark send state.
 
@@ -124,10 +124,10 @@ impl Connection {
             None => return Ok(()), // do nothing
         };
 
-        transport.send(|buf| {
+        transport.start_send(&mut crate::transport::payload_fn(|buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_CLOSE);
             buf.put_u32(channel.recipient_id.0);
-        })?;
+        }))?;
 
         channel.state = ChannelState::Closing;
 
@@ -148,11 +148,11 @@ impl Connection {
             .get_mut(&channel)
             .ok_or_else(|| crate::Error::connection("invalid channel id"))?;
 
-        transport.send(|buf| {
+        transport.start_send(&mut crate::transport::payload_fn(|buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_WINDOW_ADJUST);
             buf.put_u32(channel.recipient_id.0);
             buf.put_u32(additional);
-        })?;
+        }))?;
 
         channel.recipient_window_size = channel.recipient_window_size.saturating_add(additional);
 

@@ -57,10 +57,9 @@ impl Userauth {
         loop {
             match self.state {
                 AuthState::Init => {
-                    ready!(transport.as_mut().poll_send_ready(cx))?;
-                    transport.as_mut().send(|buf| {
-                        buf.put_slice(b"\x05\x00\x00\x00\x0Cssh-userauth");
-                    })?;
+                    const PAYLOAD: &[u8] = b"\x05\x00\x00\x00\x0Cssh-userauth";
+                    ready!(transport.as_mut().poll_send_ready(cx, PAYLOAD.len() as u32))?;
+                    transport.as_mut().start_send(&mut &PAYLOAD[..])?;
 
                     self.state = AuthState::ServiceRequest;
                 }
@@ -103,7 +102,7 @@ impl Userauth {
     {
         assert!(matches!(self.state, AuthState::AuthRequests));
 
-        transport.send(|mut buf| {
+        transport.start_send(&mut crate::transport::payload_fn(|mut buf| {
             buf.put_u8(consts::SSH_MSG_USERAUTH_REQUEST);
             put_ssh_string(&mut buf, username.as_ref());
             put_ssh_string(&mut buf, service_name.as_ref());
@@ -145,7 +144,7 @@ impl Userauth {
                     self.pending_auths.push_back(PendingAuth::Password);
                 }
             }
-        })?;
+        }))?;
         Ok(())
     }
 

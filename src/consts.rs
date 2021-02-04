@@ -1,12 +1,31 @@
-// defined in https://tools.ietf.org/html/rfc4253#section-12
+#![allow(dead_code)]
+
+// transport layer message types, defined in https://tools.ietf.org/html/rfc4253#section-12
 pub(crate) const SSH_MSG_DISCONNECT: u8 = 1;
 pub(crate) const SSH_MSG_IGNORE: u8 = 2;
 pub(crate) const SSH_MSG_UNIMPLEMENTED: u8 = 3;
 pub(crate) const SSH_MSG_DEBUG: u8 = 4;
-//pub(crate) const SSH_MSG_SERVICE_REQUEST: u8 = 5;
+pub(crate) const SSH_MSG_SERVICE_REQUEST: u8 = 5;
 pub(crate) const SSH_MSG_SERVICE_ACCEPT: u8 = 6;
 pub(crate) const SSH_MSG_KEXINIT: u8 = 20;
 pub(crate) const SSH_MSG_NEWKEYS: u8 = 21;
+
+// reason codes in disconnection message, definied in https://tools.ietf.org/html/rfc4253#section-11.1
+pub(crate) const SSH_DISCONNECT_HOST_NOT_ALLOWED_TO_CONNECT: u32 = 1;
+pub(crate) const SSH_DISCONNECT_PROTOCOL_ERROR: u32 = 2;
+pub(crate) const SSH_DISCONNECT_KEY_EXCHANGE_FAILED: u32 = 3;
+pub(crate) const SSH_DISCONNECT_RESERVED: u32 = 4;
+pub(crate) const SSH_DISCONNECT_MAC_ERROR: u32 = 5;
+pub(crate) const SSH_DISCONNECT_COMPRESSION_ERROR: u32 = 6;
+pub(crate) const SSH_DISCONNECT_SERVICE_NOT_AVAILABLE: u32 = 7;
+pub(crate) const SSH_DISCONNECT_PROTOCOL_VERSION_NOT_SUPPORTED: u32 = 8;
+pub(crate) const SSH_DISCONNECT_HOST_KEY_NOT_VERIFIABLE: u32 = 9;
+pub(crate) const SSH_DISCONNECT_CONNECTION_LOST: u32 = 10;
+pub(crate) const SSH_DISCONNECT_BY_APPLICATION: u32 = 11;
+pub(crate) const SSH_DISCONNECT_TOO_MANY_CONNECTIONS: u32 = 12;
+pub(crate) const SSH_DISCONNECT_AUTH_CANCELLED_BY_USER: u32 = 13;
+pub(crate) const SSH_DISCONNECT_NO_MORE_AUTH_METHODS_AVAILABLE: u32 = 14;
+pub(crate) const SSH_DISCONNECT_ILLEGAL_USER_NAME: u32 = 15;
 
 // defined in https://tools.ietf.org/html/rfc5656#section-7.1
 pub(crate) const SSH_MSG_KEX_ECDH_INIT: u8 = 30;
