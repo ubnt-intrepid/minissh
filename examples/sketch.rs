@@ -1,5 +1,5 @@
 use anyhow::Result;
-use futures::{future::poll_fn, ready};
+use futures::future::poll_fn;
 use minissh::{
     connection::Connection,
     transport::{DefaultTransport, Transport},
@@ -22,21 +22,18 @@ async fn main() -> Result<()> {
     let mut userauth = Userauth::default();
     poll_fn(|cx| userauth.poll_service_request(cx, transport.as_mut())).await?;
 
-    poll_fn(|cx| {
-        ready!(transport.as_mut().poll_flush(cx))?;
-        userauth
-            .send_userauth(
-                transport.as_mut(),
-                "devenv",
-                "ssh-connection",
-                AuthMethod::Password {
-                    current: "devenv",
-                    new: None,
-                },
-            )
-            .into()
-    })
-    .await?;
+    poll_fn(|cx| transport.as_mut().poll_flush(cx)).await?; // TODO: replace with poll_send_ready()
+    userauth.send_userauth(
+        transport.as_mut(),
+        "devenv",
+        "ssh-connection",
+        AuthMethod::Password {
+            current: "devenv",
+            new: None,
+        },
+    )?;
+    poll_fn(|cx| transport.as_mut().poll_flush(cx)).await?;
+
     loop {
         let res = poll_fn(|cx| userauth.poll_authenticate(cx, transport.as_mut())).await?;
         match res {
@@ -55,8 +52,13 @@ async fn main() -> Result<()> {
     }
 
     tracing::debug!("connection");
+
     let mut conn = Connection::default();
+
+    poll_fn(|cx| transport.as_mut().poll_flush(cx)).await?; // TODO: replace with poll_send_ready()
     let channel = conn.channel_open_session(transport.as_mut())?;
+    poll_fn(|cx| transport.as_mut().poll_flush(cx)).await?;
+
     loop {
         use minissh::connection::{ChannelResponse, Response};
 
@@ -75,9 +77,14 @@ async fn main() -> Result<()> {
         }
     }
 
-    poll_fn(|cx| transport.as_mut().poll_flush(cx)).await?;
+    poll_fn(|cx| transport.as_mut().poll_flush(cx)).await?; // TODO: replace with poll_send_ready()
     conn.channel_request_exec(transport.as_mut(), channel, "pwd")?;
+
+    poll_fn(|cx| transport.as_mut().poll_flush(cx)).await?; // TODO: replace with poll_send_ready()
     conn.window_adjust(transport.as_mut(), channel, 1024 * 8)?;
+
+    poll_fn(|cx| transport.as_mut().poll_flush(cx)).await?;
+
     loop {
         use minissh::connection::{ChannelResponse, Response};
 
@@ -93,6 +100,8 @@ async fn main() -> Result<()> {
             _ => (),
         }
     }
+
+    // TODO: shutdown
 
     Ok(())
 }

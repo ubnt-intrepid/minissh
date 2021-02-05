@@ -168,7 +168,6 @@ impl Userauth {
                 }
 
                 AuthState::AuthRequests => {
-                    ready!(transport.as_mut().poll_flush(cx))?;
                     let mut payload = ready!(transport.as_mut().poll_recv(cx, &mut self.recv_buf))?;
 
                     let typ = payload.get_u8();

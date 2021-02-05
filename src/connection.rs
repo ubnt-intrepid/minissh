@@ -167,8 +167,6 @@ impl Connection {
     where
         T: Transport,
     {
-        ready!(transport.as_mut().poll_flush(cx))?;
-
         loop {
             let mut payload = ready!(transport.as_mut().poll_recv(cx, &mut self.recv_buf))?;
             tracing::trace!("Handle incoming message");
