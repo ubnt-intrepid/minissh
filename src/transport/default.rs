@@ -21,10 +21,114 @@ const CHACHA20_POLY1305: &str = "chacha20-poly1305@openssh.com";
 
 const CLIENT_SSH_ID: &[u8] = concat!("SSH-2.0-minissh_", env!("CARGO_PKG_VERSION")).as_bytes();
 
+/// The object that drives SSH transport layer.
+pub struct DefaultTransport<T> {
+    inner: Inner<T>,
+}
+
+impl<T> DefaultTransport<T>
+where
+    T: AsyncRead + AsyncWrite,
+{
+    /// Create a new `Transport` with the specified I/O object.
+    pub fn new(stream: T) -> Self {
+        Self {
+            inner: Inner {
+                stream,
+                state: TransportState::Init,
+                send: SendPacket::new(0x10000),
+                recv: RecvPacket::default(),
+                kex: KeyExchange::default(),
+                session_id: None,
+                rng: rand::SystemRandom::new(),
+            },
+        }
+    }
+
+    /// Return a reference to underlying I/O object.
+    #[inline]
+    pub fn get_ref(&self) -> &T {
+        &self.inner.stream
+    }
+
+    /// Return a mutable reference to underlying I/O object.
+    #[inline]
+    pub fn get_mut(&mut self) -> &mut T
+    where
+        T: Unpin,
+    {
+        &mut self.inner.stream
+    }
+
+    /// Return a pinned reference to underlying I/O object.
+    #[inline]
+    pub fn get_pin_mut(self: Pin<&mut Self>) -> Pin<&mut T> {
+        self.inner_proj().stream
+    }
+
+    #[inline]
+    fn inner_proj(self: Pin<&mut Self>) -> InnerProj<'_, T> {
+        unsafe { Pin::map_unchecked_mut(self, |me| &mut me.inner) }.project()
+    }
+}
+
+impl<T> Transport for DefaultTransport<T>
+where
+    T: AsyncRead + AsyncWrite,
+{
+    #[inline]
+    fn poll_handshake(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), crate::Error>> {
+        self.inner_proj().poll_handshake(cx)
+    }
+
+    #[inline]
+    fn session_id(&self) -> &[u8] {
+        self.inner.session_id.as_ref().unwrap().as_ref()
+    }
+
+    #[inline]
+    fn poll_recv<'a>(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        recv_buf: &'a mut [u8],
+    ) -> Poll<Result<&'a [u8], crate::Error>> {
+        self.inner_proj()
+            .poll_recv_inner(cx, recv_buf)
+            .map_ok(move |range| &recv_buf[range])
+    }
+
+    #[inline]
+    fn poll_send_ready(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        payload_length: u32,
+    ) -> Poll<Result<(), crate::Error>> {
+        self.inner_proj().poll_send_ready(cx, payload_length)
+    }
+
+    #[inline]
+    fn start_send<P>(self: Pin<&mut Self>, payload: &mut P) -> Result<(), crate::Error>
+    where
+        P: Payload,
+    {
+        self.inner_proj().start_send(payload)
+    }
+
+    #[inline]
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), crate::Error>> {
+        self.inner_proj().poll_flush(cx)
+    }
+}
+
 pin_project! {
-    #[project = DefaultTransportProj]
-    /// The object that drives SSH transport layer.
-    pub struct DefaultTransport<T> {
+    #[project = InnerProj]
+    struct Inner<T> {
         #[pin]
         stream: T,
         state: TransportState,
@@ -55,46 +159,7 @@ enum TransportState {
     Disconnected,
 }
 
-impl<T> DefaultTransport<T>
-where
-    T: AsyncRead + AsyncWrite,
-{
-    /// Create a new `Transport` with the specified I/O object.
-    pub fn new(stream: T) -> Self {
-        Self {
-            stream,
-            state: TransportState::Init,
-            send: SendPacket::new(0x10000),
-            recv: RecvPacket::default(),
-            kex: KeyExchange::default(),
-            session_id: None,
-            rng: rand::SystemRandom::new(),
-        }
-    }
-
-    /// Return a reference to underlying I/O object.
-    #[inline]
-    pub fn get_ref(&self) -> &T {
-        &self.stream
-    }
-
-    /// Return a mutable reference to underlying I/O object.
-    #[inline]
-    pub fn get_mut(&mut self) -> &mut T
-    where
-        T: Unpin,
-    {
-        &mut self.stream
-    }
-
-    /// Return a pinned reference to underlying I/O object.
-    #[inline]
-    pub fn get_pin_mut(self: Pin<&mut Self>) -> Pin<&mut T> {
-        self.project().stream
-    }
-}
-
-impl<T> DefaultTransportProj<'_, T>
+impl<T> InnerProj<'_, T>
 where
     T: AsyncRead + AsyncWrite,
 {
@@ -403,60 +468,6 @@ where
 
     fn poll_flush(&mut self, cx: &mut task::Context<'_>) -> Poll<Result<(), crate::Error>> {
         self.send.poll_flush(cx, self.stream.as_mut())
-    }
-}
-
-impl<T> Transport for DefaultTransport<T>
-where
-    T: AsyncRead + AsyncWrite,
-{
-    #[inline]
-    fn poll_handshake(
-        self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-    ) -> Poll<Result<(), crate::Error>> {
-        self.project().poll_handshake(cx)
-    }
-
-    #[inline]
-    fn session_id(&self) -> &[u8] {
-        self.session_id.as_ref().unwrap().as_ref()
-    }
-
-    #[inline]
-    fn poll_recv<'a>(
-        self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-        recv_buf: &'a mut [u8],
-    ) -> Poll<Result<&'a [u8], crate::Error>> {
-        self.project()
-            .poll_recv_inner(cx, recv_buf)
-            .map_ok(move |range| &recv_buf[range])
-    }
-
-    #[inline]
-    fn poll_send_ready(
-        self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-        payload_length: u32,
-    ) -> Poll<Result<(), crate::Error>> {
-        self.project().poll_send_ready(cx, payload_length)
-    }
-
-    #[inline]
-    fn start_send<P>(self: Pin<&mut Self>, payload: &mut P) -> Result<(), crate::Error>
-    where
-        P: Payload,
-    {
-        self.project().start_send(payload)
-    }
-
-    #[inline]
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-    ) -> Poll<Result<(), crate::Error>> {
-        self.project().poll_flush(cx)
     }
 }
 
