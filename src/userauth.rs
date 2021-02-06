@@ -14,7 +14,7 @@ use futures::{
     ready,
     task::{self, Poll},
 };
-use std::{collections::VecDeque, pin::Pin};
+use std::{collections::VecDeque, convert::TryFrom, mem, pin::Pin};
 
 /// The object that manages authentication state during a SSH session.
 pub struct Userauth {
@@ -89,67 +89,112 @@ impl Userauth {
         Poll::Ready(Ok(()))
     }
 
-    /// Send an user authentication request.
-    pub fn send_userauth<T>(
+    #[allow(clippy::too_many_arguments)]
+    pub fn poll_userauth_publickey<T>(
         &mut self,
-        transport: Pin<&mut T>,
+        cx: &mut task::Context<'_>,
+        mut transport: Pin<&mut T>,
         username: &str,
         service_name: &str,
-        method: AuthMethod<'_>,
-    ) -> Result<(), crate::Error>
+        algorithm: &[u8],
+        blob: &[u8],
+        signature: Option<&[u8]>,
+    ) -> Poll<Result<(), crate::Error>>
     where
         T: Transport,
     {
+        const METHOD_NAME: &[u8] = b"publickey";
+
         assert!(matches!(self.state, AuthState::AuthRequests));
+
+        let payload_length = u32::try_from(
+            mem::size_of::<u8>()
+                + ssh_string_len(username.as_ref())
+                + ssh_string_len(service_name.as_ref())
+                + ssh_string_len(METHOD_NAME)
+                + mem::size_of::<u8>()
+                + ssh_string_len(algorithm)
+                + ssh_string_len(blob)
+                + signature.map_or(0, ssh_string_len),
+        )
+        .expect("payload is too large");
+        ready!(transport.as_mut().poll_send_ready(cx, payload_length))?;
 
         transport.start_send(&mut crate::transport::payload_fn(|mut buf| {
             buf.put_u8(consts::SSH_MSG_USERAUTH_REQUEST);
             put_ssh_string(&mut buf, username.as_ref());
             put_ssh_string(&mut buf, service_name.as_ref());
-            match method {
-                AuthMethod::PublicKey {
-                    algorithm,
-                    blob: key,
-                    signature,
-                } => {
-                    put_ssh_string(&mut buf, b"publickey"); // method name
-                    if let Some(signature) = signature {
-                        buf.put_u8(1);
-                        put_ssh_string(&mut buf, algorithm);
-                        put_ssh_string(&mut buf, key);
-                        put_ssh_string(&mut buf, signature);
-                        self.pending_auths.push_back(PendingAuth::PublicKey {
-                            has_signature: true,
-                        });
-                    } else {
-                        buf.put_u8(0);
-                        put_ssh_string(&mut buf, algorithm);
-                        put_ssh_string(&mut buf, key);
-                        self.pending_auths.push_back(PendingAuth::PublicKey {
-                            has_signature: false,
-                        });
-                    }
-                }
-
-                AuthMethod::Password { current, new } => {
-                    put_ssh_string(&mut buf, b"password"); // method name
-                    if let Some(new) = new {
-                        buf.put_u8(1);
-                        put_ssh_string(&mut buf, current.as_ref());
-                        put_ssh_string(&mut buf, new.as_ref());
-                    } else {
-                        buf.put_u8(0);
-                        put_ssh_string(&mut buf, current.as_ref());
-                    }
-                    self.pending_auths.push_back(PendingAuth::Password);
-                }
+            put_ssh_string(&mut buf, METHOD_NAME);
+            if let Some(signature) = signature {
+                buf.put_u8(1);
+                put_ssh_string(&mut buf, algorithm);
+                put_ssh_string(&mut buf, blob);
+                put_ssh_string(&mut buf, signature);
+            } else {
+                buf.put_u8(0);
+                put_ssh_string(&mut buf, algorithm);
+                put_ssh_string(&mut buf, blob);
             }
         }))?;
-        Ok(())
+
+        self.pending_auths.push_back(PendingAuth::PublicKey {
+            has_signature: signature.is_some(),
+        });
+
+        Poll::Ready(Ok(()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn poll_userauth_password<T>(
+        &mut self,
+        cx: &mut task::Context<'_>,
+        mut transport: Pin<&mut T>,
+        username: &str,
+        service_name: &str,
+        password: &str,
+        new_password: Option<&str>,
+    ) -> Poll<Result<(), crate::Error>>
+    where
+        T: Transport,
+    {
+        const METHOD_NAME: &[u8] = b"password";
+
+        assert!(matches!(self.state, AuthState::AuthRequests));
+
+        let payload_length = u32::try_from(
+            mem::size_of::<u8>()
+                + ssh_string_len(username.as_ref())
+                + ssh_string_len(service_name.as_ref())
+                + ssh_string_len(METHOD_NAME)
+                + mem::size_of::<u8>()
+                + ssh_string_len(password.as_ref())
+                + new_password.map_or(0, |p| ssh_string_len(p.as_ref())),
+        )
+        .expect("payload is too large");
+        ready!(transport.as_mut().poll_send_ready(cx, payload_length))?;
+
+        transport.start_send(&mut crate::transport::payload_fn(|mut buf| {
+            buf.put_u8(consts::SSH_MSG_USERAUTH_REQUEST);
+            put_ssh_string(&mut buf, username.as_ref());
+            put_ssh_string(&mut buf, service_name.as_ref());
+            put_ssh_string(&mut buf, METHOD_NAME);
+            if let Some(new_password) = new_password {
+                buf.put_u8(1);
+                put_ssh_string(&mut buf, password.as_ref());
+                put_ssh_string(&mut buf, new_password.as_ref());
+            } else {
+                buf.put_u8(0);
+                put_ssh_string(&mut buf, password.as_ref());
+            }
+        }))?;
+
+        self.pending_auths.push_back(PendingAuth::Password);
+
+        Poll::Ready(Ok(()))
     }
 
     /// Wait for the completion of authentication process.
-    pub fn poll_authenticate<T>(
+    pub fn poll_recv<T>(
         &mut self,
         cx: &mut task::Context<'_>,
         mut transport: Pin<&mut T>,
@@ -260,20 +305,6 @@ impl Userauth {
 }
 
 #[non_exhaustive]
-pub enum AuthMethod<'a> {
-    PublicKey {
-        algorithm: &'a [u8],
-        blob: &'a [u8],
-        signature: Option<&'a [u8]>,
-    },
-
-    Password {
-        current: &'a str,
-        new: Option<&'a str>,
-    },
-}
-
-#[non_exhaustive]
 #[must_use]
 pub enum AuthResult {
     Success,
@@ -293,4 +324,9 @@ pub enum AuthResult {
         prompt: Vec<u8>,
         language_tag: Vec<u8>,
     },
+}
+
+#[inline(always)]
+const fn ssh_string_len(s: &[u8]) -> usize {
+    mem::size_of::<u32>() + s.len()
 }
