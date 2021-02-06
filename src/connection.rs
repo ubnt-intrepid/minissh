@@ -8,7 +8,7 @@ use futures::{
     ready,
     task::{self, Poll},
 };
-use std::{cmp, collections::HashMap, num, pin::Pin};
+use std::{cmp, collections::HashMap, convert::TryFrom, mem, num, pin::Pin};
 
 pub struct Connection {
     initial_window_size: u32,
@@ -40,24 +40,38 @@ impl Connection {
     }
 
     /// Request to open a session channel.
-    pub fn channel_open_session<T>(
+    pub fn poll_channel_open_session<T>(
         &mut self,
-        transport: Pin<&mut T>,
-    ) -> Result<ChannelId, crate::Error>
+        cx: &mut task::Context<'_>,
+        mut transport: Pin<&mut T>,
+    ) -> Poll<Result<ChannelId, crate::Error>>
     where
         T: Transport,
     {
+        const CHANNEL_TYPE: &[u8] = b"session";
+
+        let payload_length = u32::try_from(
+            mem::size_of::<u8>() // packet type
+            + ssh_string_len(CHANNEL_TYPE)
+            + mem::size_of::<u32>() // sender channel
+            + mem::size_of::<u32>() // initial window size
+            + mem::size_of::<u32>(), // maximum packet size
+        )
+        .expect("payload is too large");
+
+        ready!(transport.as_mut().poll_send_ready(cx, payload_length))?;
+
         let sender_channel = self.allocate_channel();
 
         transport.start_send(&mut crate::transport::payload_fn(|mut buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_OPEN);
-            put_ssh_string(&mut buf, b"session");
+            put_ssh_string(&mut buf, CHANNEL_TYPE); //
             buf.put_u32(sender_channel.0);
             buf.put_u32(self.initial_window_size);
             buf.put_u32(self.maximum_packet_size);
         }))?;
 
-        Ok(sender_channel)
+        Poll::Ready(Ok(sender_channel))
     }
 
     fn allocate_channel(&mut self) -> ChannelId {
@@ -84,62 +98,55 @@ impl Connection {
         }
     }
 
-    pub fn channel_request_exec<T>(
+    pub fn poll_channel_request_exec<T>(
         &mut self,
-        transport: Pin<&mut T>,
+        cx: &mut task::Context<'_>,
+        mut transport: Pin<&mut T>,
         channel: ChannelId,
         command: &str,
-    ) -> Result<(), crate::Error>
+        want_reply: bool,
+    ) -> Poll<Result<(), crate::Error>>
     where
         T: Transport,
     {
+        const REQUEST_TYPE: &[u8] = b"exec";
+
         let channel = self
             .channels
             .get_mut(&channel)
             .ok_or_else(|| crate::Error::connection("invalid channel id"))?;
 
+        let payload_length = u32::try_from(
+            mem::size_of::<u8>() // packet type
+            + mem::size_of::<u32>() // recipient id
+            + ssh_string_len(REQUEST_TYPE)
+            + mem::size_of::<u8>() // want reply
+            + ssh_string_len(command.as_ref()),
+        )
+        .expect("payload is too large");
+
+        ready!(transport.as_mut().poll_send_ready(cx, payload_length))?;
+
         transport.start_send(&mut crate::transport::payload_fn(|mut buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_REQUEST);
             buf.put_u32(channel.recipient_id.0);
-            put_ssh_string(&mut buf, b"exec");
-            buf.put_u8(0); // want_reply=FALSE
+            put_ssh_string(&mut buf, REQUEST_TYPE);
+            buf.put_u8(if want_reply { 1 } else { 0 });
             put_ssh_string(&mut buf, command.as_ref());
         }))?;
 
         // TODO: mark send state.
 
-        Ok(())
+        Poll::Ready(Ok(()))
     }
 
-    pub fn channel_close<T>(
+    pub fn poll_channel_window_adjust<T>(
         &mut self,
-        transport: Pin<&mut T>,
-        channel: ChannelId,
-    ) -> Result<(), crate::Error>
-    where
-        T: Transport,
-    {
-        let channel = match self.channels.get_mut(&channel) {
-            Some(ch) => ch,
-            None => return Ok(()), // do nothing
-        };
-
-        transport.start_send(&mut crate::transport::payload_fn(|buf| {
-            buf.put_u8(consts::SSH_MSG_CHANNEL_CLOSE);
-            buf.put_u32(channel.recipient_id.0);
-        }))?;
-
-        channel.state = ChannelState::Closing;
-
-        Ok(())
-    }
-
-    pub fn window_adjust<T>(
-        &mut self,
-        transport: Pin<&mut T>,
+        cx: &mut task::Context<'_>,
+        mut transport: Pin<&mut T>,
         channel: ChannelId,
         additional: u32,
-    ) -> Result<(), crate::Error>
+    ) -> Poll<Result<(), crate::Error>>
     where
         T: Transport,
     {
@@ -147,6 +154,15 @@ impl Connection {
             .channels
             .get_mut(&channel)
             .ok_or_else(|| crate::Error::connection("invalid channel id"))?;
+
+        let payload_length = u32::try_from(
+            mem::size_of::<u8>() // packet type
+                + mem::size_of::<u32>() // recipient id
+                + mem::size_of::<u32>(), // additional
+        )
+        .expect("payload is too large");
+
+        ready!(transport.as_mut().poll_send_ready(cx, payload_length))?;
 
         transport.start_send(&mut crate::transport::payload_fn(|buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_WINDOW_ADJUST);
@@ -156,7 +172,35 @@ impl Connection {
 
         channel.recipient_window_size = channel.recipient_window_size.saturating_add(additional);
 
-        Ok(())
+        Poll::Ready(Ok(()))
+    }
+
+    pub fn poll_channel_close<T>(
+        &mut self,
+        cx: &mut task::Context<'_>,
+        mut transport: Pin<&mut T>,
+        channel: ChannelId,
+    ) -> Poll<Result<(), crate::Error>>
+    where
+        T: Transport,
+    {
+        let channel = match self.channels.get_mut(&channel) {
+            Some(ch) => ch,
+            None => return Poll::Ready(Ok(())), // do nothing
+        };
+
+        // packet_type(u8) + recipient_id(u32)
+        let payload_length = (mem::size_of::<u8>() + mem::size_of::<u32>()) as u32;
+        ready!(transport.as_mut().poll_send_ready(cx, payload_length))?;
+
+        transport.start_send(&mut crate::transport::payload_fn(|buf| {
+            buf.put_u8(consts::SSH_MSG_CHANNEL_CLOSE);
+            buf.put_u32(channel.recipient_id.0);
+        }))?;
+
+        channel.state = ChannelState::Closing;
+
+        Poll::Ready(Ok(()))
     }
 
     pub fn poll_recv<T>(
@@ -385,4 +429,9 @@ enum ChannelState {
     Opening,
     OpenConfirmed,
     Closing,
+}
+
+#[inline(always)]
+const fn ssh_string_len(s: &[u8]) -> usize {
+    mem::size_of::<u32>() + s.len()
 }

@@ -56,8 +56,7 @@ async fn main() -> Result<()> {
 
     let mut conn = Connection::default();
 
-    poll_fn(|cx| transport.as_mut().poll_flush(cx)).await?; // TODO: replace with poll_send_ready()
-    let channel = conn.channel_open_session(transport.as_mut())?;
+    let channel = poll_fn(|cx| conn.poll_channel_open_session(cx, transport.as_mut())).await?;
     poll_fn(|cx| transport.as_mut().poll_flush(cx)).await?;
 
     loop {
@@ -78,12 +77,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    poll_fn(|cx| transport.as_mut().poll_flush(cx)).await?; // TODO: replace with poll_send_ready()
-    conn.channel_request_exec(transport.as_mut(), channel, "pwd")?;
-
-    poll_fn(|cx| transport.as_mut().poll_flush(cx)).await?; // TODO: replace with poll_send_ready()
-    conn.window_adjust(transport.as_mut(), channel, 1024 * 8)?;
-
+    poll_fn(|cx| conn.poll_channel_request_exec(cx, transport.as_mut(), channel, "pwd", false))
+        .await?;
+    poll_fn(|cx| conn.poll_channel_window_adjust(cx, transport.as_mut(), channel, 1024 * 8))
+        .await?;
     poll_fn(|cx| transport.as_mut().poll_flush(cx)).await?;
 
     loop {
@@ -99,6 +96,18 @@ async fn main() -> Result<()> {
                 break;
             }
             _ => (),
+        }
+    }
+
+    poll_fn(|cx| conn.poll_channel_close(cx, transport.as_mut(), channel)).await?;
+    poll_fn(|cx| transport.as_mut().poll_flush(cx)).await?;
+    loop {
+        use minissh::connection::{ChannelResponse, Response};
+
+        let response = poll_fn(|cx| conn.poll_recv(cx, transport.as_mut())).await?;
+        if let Response::Channel(_id, ChannelResponse::Close) = response {
+            tracing::debug!("close");
+            break;
         }
     }
 
