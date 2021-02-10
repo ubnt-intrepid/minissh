@@ -1,4 +1,4 @@
-use super::{Payload, Transport};
+use super::Transport;
 use crate::{
     consts,
     util::{get_ssh_string, peek_u8, put_ssh_string},
@@ -90,14 +90,12 @@ where
     }
 
     #[inline]
-    fn poll_recv<'a>(
+    fn poll_recv(
         self: Pin<&mut Self>,
         cx: &mut task::Context<'_>,
-        recv_buf: &'a mut [u8],
-    ) -> Poll<Result<&'a [u8], crate::Error>> {
-        self.inner_proj()
-            .poll_recv_inner(cx, recv_buf)
-            .map_ok(move |range| &recv_buf[range])
+        recv_buf: &mut [u8],
+    ) -> Poll<Result<Range<usize>, crate::Error>> {
+        self.inner_proj().poll_recv(cx, recv_buf)
     }
 
     #[inline]
@@ -110,11 +108,11 @@ where
     }
 
     #[inline]
-    fn start_send<P>(self: Pin<&mut Self>, payload: &mut P) -> Result<(), crate::Error>
+    fn start_send<F>(self: Pin<&mut Self>, filler: F) -> Result<(), crate::Error>
     where
-        P: Payload,
+        F: FnOnce(&mut dyn BufMut),
     {
-        self.inner_proj().start_send(payload)
+        self.inner_proj().start_send(filler)
     }
 
     #[inline]
@@ -347,7 +345,7 @@ where
         Poll::Ready(Ok(()))
     }
 
-    fn poll_recv_inner(
+    fn poll_recv(
         &mut self,
         cx: &mut task::Context<'_>,
         recv_buf: &mut [u8],
@@ -449,9 +447,9 @@ where
         }
     }
 
-    fn start_send<P>(&mut self, payload: &mut P) -> Result<(), crate::Error>
+    fn start_send<F>(&mut self, filler: F) -> Result<(), crate::Error>
     where
-        P: Payload,
+        F: FnOnce(&mut dyn BufMut),
     {
         let span = tracing::trace_span!("Transport::send");
         let _enter = span.enter();
@@ -461,7 +459,7 @@ where
             "transport is not ready to send"
         );
 
-        self.send.start_send(payload)?;
+        self.send.start_send(filler)?;
 
         Ok(())
     }
@@ -558,9 +556,9 @@ impl SendPacket {
         self.poll_flush(cx, stream)
     }
 
-    fn start_send<P>(&mut self, payload: &mut P) -> Result<(), crate::Error>
+    fn start_send<F>(&mut self, filler: F) -> Result<(), crate::Error>
     where
-        P: Payload,
+        F: FnOnce(&mut dyn BufMut),
     {
         assert!(
             matches!(self.state, SendPacketState::Buffering),
@@ -574,7 +572,7 @@ impl SendPacket {
                 buf: &mut buf[4 + 1..], // packet_length(u32) + padding_length(u8)
                 filled: 0,
             };
-            payload.fill_buffer(&mut send_buf);
+            filler(&mut send_buf);
             send_buf.filled
         };
         tracing::trace!("--> payload_length = {}", payload_length);
@@ -936,9 +934,9 @@ impl KeyExchange {
                     tracing::trace!("--> SendingClientKexInit");
 
                     ready!(send.poll_flush(cx, stream.as_mut()))?;
-                    send.start_send(&mut super::payload_fn(|buf| {
+                    send.start_send(|buf| {
                         buf.put_slice(&self.client_kexinit_payload[..]);
-                    }))?;
+                    })?;
                     self.state = KeyExchangeState::SendingEcdhInit;
                 }
 
@@ -948,10 +946,10 @@ impl KeyExchange {
                     ready!(send.poll_flush(cx, stream.as_mut()))?;
 
                     let client_public_key = self.client_public_key();
-                    send.start_send(&mut super::payload_fn(|mut buf| {
+                    send.start_send(|mut buf| {
                         buf.put_u8(consts::SSH_MSG_KEX_ECDH_INIT);
                         put_ssh_string(&mut buf, client_public_key.as_ref());
-                    }))?;
+                    })?;
 
                     self.state = KeyExchangeState::ReceivingEcdhReply;
                 }
@@ -1084,9 +1082,9 @@ impl KeyExchange {
 
                     ready!(send.poll_flush(cx, stream.as_mut()))?;
 
-                    send.start_send(&mut super::payload_fn(|buf| {
+                    send.start_send(|buf| {
                         buf.put_u8(consts::SSH_MSG_NEWKEYS);
-                    }))?;
+                    })?;
 
                     self.state = KeyExchangeState::ReceivingServerNewKeys;
                 }

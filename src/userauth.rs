@@ -58,15 +58,17 @@ impl Userauth {
             match self.state {
                 AuthState::Init => {
                     const PAYLOAD: &[u8] = b"\x05\x00\x00\x00\x0Cssh-userauth";
-                    ready!(transport.as_mut().poll_send_ready(cx, PAYLOAD.len() as u32))?;
-                    transport.as_mut().start_send(&mut &PAYLOAD[..])?;
-
+                    ready!(transport.as_mut().poll_send(cx, &mut &PAYLOAD[..]))?;
                     self.state = AuthState::ServiceRequest;
                 }
 
                 AuthState::ServiceRequest => {
                     ready!(transport.as_mut().poll_flush(cx))?;
-                    let mut payload = ready!(transport.as_mut().poll_recv(cx, &mut self.recv_buf))?;
+
+                    let mut payload = {
+                        let range = ready!(transport.as_mut().poll_recv(cx, &mut self.recv_buf))?;
+                        &self.recv_buf[range]
+                    };
 
                     let typ = payload.get_u8();
                     if typ != consts::SSH_MSG_SERVICE_ACCEPT {
@@ -120,7 +122,7 @@ impl Userauth {
         .expect("payload is too large");
         ready!(transport.as_mut().poll_send_ready(cx, payload_length))?;
 
-        transport.start_send(&mut crate::transport::payload_fn(|mut buf| {
+        transport.start_send(|mut buf| {
             buf.put_u8(consts::SSH_MSG_USERAUTH_REQUEST);
             put_ssh_string(&mut buf, username.as_ref());
             put_ssh_string(&mut buf, service_name.as_ref());
@@ -135,7 +137,7 @@ impl Userauth {
                 put_ssh_string(&mut buf, algorithm);
                 put_ssh_string(&mut buf, blob);
             }
-        }))?;
+        })?;
 
         self.pending_auths.push_back(PendingAuth::PublicKey {
             has_signature: signature.is_some(),
@@ -173,7 +175,7 @@ impl Userauth {
         .expect("payload is too large");
         ready!(transport.as_mut().poll_send_ready(cx, payload_length))?;
 
-        transport.start_send(&mut crate::transport::payload_fn(|mut buf| {
+        transport.start_send(|mut buf| {
             buf.put_u8(consts::SSH_MSG_USERAUTH_REQUEST);
             put_ssh_string(&mut buf, username.as_ref());
             put_ssh_string(&mut buf, service_name.as_ref());
@@ -186,7 +188,7 @@ impl Userauth {
                 buf.put_u8(0);
                 put_ssh_string(&mut buf, password.as_ref());
             }
-        }))?;
+        })?;
 
         self.pending_auths.push_back(PendingAuth::Password);
 
@@ -213,7 +215,10 @@ impl Userauth {
                 }
 
                 AuthState::AuthRequests => {
-                    let mut payload = ready!(transport.as_mut().poll_recv(cx, &mut self.recv_buf))?;
+                    let mut payload = {
+                        let range = ready!(transport.as_mut().poll_recv(cx, &mut self.recv_buf))?;
+                        &self.recv_buf[range]
+                    };
 
                     let typ = payload.get_u8();
                     match typ {

@@ -63,13 +63,13 @@ impl Connection {
 
         let sender_channel = self.allocate_channel();
 
-        transport.start_send(&mut crate::transport::payload_fn(|mut buf| {
+        transport.start_send(|mut buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_OPEN);
             put_ssh_string(&mut buf, CHANNEL_TYPE); //
             buf.put_u32(sender_channel.0);
             buf.put_u32(self.initial_window_size);
             buf.put_u32(self.maximum_packet_size);
-        }))?;
+        })?;
 
         Poll::Ready(Ok(sender_channel))
     }
@@ -127,13 +127,13 @@ impl Connection {
 
         ready!(transport.as_mut().poll_send_ready(cx, payload_length))?;
 
-        transport.start_send(&mut crate::transport::payload_fn(|mut buf| {
+        transport.start_send(|mut buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_REQUEST);
             buf.put_u32(channel.recipient_id.0);
             put_ssh_string(&mut buf, REQUEST_TYPE);
             buf.put_u8(if want_reply { 1 } else { 0 });
             put_ssh_string(&mut buf, command.as_ref());
-        }))?;
+        })?;
 
         // TODO: mark send state.
 
@@ -164,11 +164,11 @@ impl Connection {
 
         ready!(transport.as_mut().poll_send_ready(cx, payload_length))?;
 
-        transport.start_send(&mut crate::transport::payload_fn(|buf| {
+        transport.start_send(|buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_WINDOW_ADJUST);
             buf.put_u32(channel.recipient_id.0);
             buf.put_u32(additional);
-        }))?;
+        })?;
 
         channel.recipient_window_size = channel.recipient_window_size.saturating_add(additional);
 
@@ -193,10 +193,10 @@ impl Connection {
         let payload_length = (mem::size_of::<u8>() + mem::size_of::<u32>()) as u32;
         ready!(transport.as_mut().poll_send_ready(cx, payload_length))?;
 
-        transport.start_send(&mut crate::transport::payload_fn(|buf| {
+        transport.start_send(|buf| {
             buf.put_u8(consts::SSH_MSG_CHANNEL_CLOSE);
             buf.put_u32(channel.recipient_id.0);
-        }))?;
+        })?;
 
         channel.state = ChannelState::Closing;
 
@@ -212,7 +212,11 @@ impl Connection {
         T: Transport,
     {
         loop {
-            let mut payload = ready!(transport.as_mut().poll_recv(cx, &mut self.recv_buf))?;
+            let mut payload = {
+                let range = ready!(transport.as_mut().poll_recv(cx, &mut self.recv_buf))?;
+                &self.recv_buf[range]
+            };
+
             tracing::trace!("Handle incoming message");
             match payload.get_u8() {
                 // Global request described in https://tools.ietf.org/html/rfc4254#section-4

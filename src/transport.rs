@@ -9,8 +9,11 @@ mod default;
 pub use default::DefaultTransport;
 
 use bytes::{Buf, BufMut};
-use futures::task::{self, Poll};
-use std::pin::Pin;
+use futures::{
+    ready,
+    task::{self, Poll},
+};
+use std::{convert::TryFrom, ops::Range, pin::Pin};
 
 /// A trait that abstracts SSH transport layer.
 pub trait Transport {
@@ -37,16 +40,15 @@ pub trait Transport {
     ///
     /// `recv_buf` is used for reading the cipher text and decrypting,
     /// and must have enough capacity for storing intermediate data.
-    /// After decryption, the payload part is returned as a sub slice of
-    /// `recv_buf`.
+    /// The returned value represents the range of payload data in `recv_buf`.
     ///
     /// Several packet types, such as key exchange negotiation, are filtered out
     /// and handle by the transport.
-    fn poll_recv<'a>(
+    fn poll_recv(
         self: Pin<&mut Self>,
         cx: &mut task::Context<'_>,
-        recv_buf: &'a mut [u8],
-    ) -> Poll<Result<&'a [u8], crate::Error>>;
+        recv_buf: &mut [u8],
+    ) -> Poll<Result<Range<usize>, crate::Error>>;
 
     /// Prepare the transport to write a packet of specified payload length.
     ///
@@ -64,43 +66,33 @@ pub trait Transport {
     /// Begin the process to write a packet of specified payload data.
     ///
     /// The actual transmission of packet data is deferred until `poll_flush` is called.
-    fn start_send<P>(self: Pin<&mut Self>, payload: &mut P) -> Result<(), crate::Error>
+    fn start_send<F>(self: Pin<&mut Self>, filler: F) -> Result<(), crate::Error>
     where
-        P: Payload;
+        F: FnOnce(&mut dyn BufMut);
+
+    /// Write a packet to the peer.
+    fn poll_send<B>(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        payload: &mut B,
+    ) -> Poll<Result<(), crate::Error>>
+    where
+        B: Buf,
+    {
+        let payload_length = u32::try_from(payload.remaining()).expect("payload is too large");
+        ready!(self.as_mut().poll_send_ready(cx, payload_length))?;
+        self.start_send(|buf| {
+            while payload.has_remaining() {
+                buf.put_slice(payload.chunk());
+                payload.advance(payload.chunk().len());
+            }
+        })?;
+        Poll::Ready(Ok(()))
+    }
 
     /// Flush the internal buffer to the I/O.
     fn poll_flush(
         self: Pin<&mut Self>,
         cx: &mut task::Context<'_>,
     ) -> Poll<Result<(), crate::Error>>;
-}
-
-pub trait Payload {
-    fn fill_buffer(&mut self, buf: &mut dyn BufMut);
-}
-
-impl<T: Buf> Payload for T {
-    fn fill_buffer(&mut self, buf: &mut dyn BufMut) {
-        while self.has_remaining() {
-            buf.put_slice(self.chunk());
-            self.advance(self.chunk().len());
-        }
-    }
-}
-
-pub(crate) fn payload_fn<F>(f: F) -> impl Payload
-where
-    F: FnOnce(&mut dyn BufMut),
-{
-    struct PayloadFn<F>(Option<F>);
-    impl<F> Payload for PayloadFn<F>
-    where
-        F: FnOnce(&mut dyn BufMut),
-    {
-        fn fill_buffer(&mut self, buf: &mut dyn BufMut) {
-            let filler = self.0.take().expect("already consumed");
-            filler(buf)
-        }
-    }
-    PayloadFn(Some(f))
 }
