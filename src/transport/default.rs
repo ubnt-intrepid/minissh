@@ -11,7 +11,10 @@ use futures::{
 use pin_project_lite::pin_project;
 use ring::{aead::chacha20_poly1305_openssh as aead, agreement, digest, rand, signature};
 use std::{cmp, convert::TryInto as _, io, mem::MaybeUninit, num, ops::Range, pin::Pin};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::{TcpStream, ToSocketAddrs},
+};
 
 // defined in https://git.libssh.org/projects/libssh.git/tree/doc/curve25519-sha256@libssh.org.txt#n62
 const CURVE25519_SHA256: &str = "curve25519-sha256@libssh.org";
@@ -69,6 +72,16 @@ where
     #[inline]
     fn inner_proj(self: Pin<&mut Self>) -> InnerProj<'_, T> {
         unsafe { Pin::map_unchecked_mut(self, |me| &mut me.inner) }.project()
+    }
+}
+
+impl DefaultTransport<TcpStream> {
+    pub async fn connect<A>(addr: A) -> io::Result<Self>
+    where
+        A: ToSocketAddrs,
+    {
+        let stream = TcpStream::connect(addr).await?;
+        Ok(Self::new(stream))
     }
 }
 

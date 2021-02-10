@@ -12,10 +12,8 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     tracing::debug!("transport");
-    let stream = TcpStream::connect("127.0.0.1:22").await?;
-    let transport = DefaultTransport::new(stream);
+    let transport = DefaultTransport::connect("127.0.0.1:22").await?;
     tokio::pin!(transport);
-
     poll_fn(|cx| transport.as_mut().poll_handshake(cx)).await?;
 
     tracing::debug!("userauth");
