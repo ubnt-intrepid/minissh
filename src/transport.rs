@@ -13,7 +13,11 @@ use futures::{
     ready,
     task::{self, Poll},
 };
-use std::{convert::TryFrom, ops::Range, pin::Pin};
+use std::{
+    convert::TryFrom,
+    ops::{DerefMut, Range},
+    pin::Pin,
+};
 
 /// A trait that abstracts SSH transport layer.
 pub trait Transport {
@@ -95,4 +99,133 @@ pub trait Transport {
         self: Pin<&mut Self>,
         cx: &mut task::Context<'_>,
     ) -> Poll<Result<(), crate::Error>>;
+}
+
+impl<T: ?Sized> Transport for &mut T
+where
+    T: Transport + Unpin,
+{
+    #[inline]
+    fn poll_handshake(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), crate::Error>> {
+        Pin::new(&mut **self).poll_handshake(cx)
+    }
+
+    #[inline]
+    fn session_id(&self) -> &[u8] {
+        (**self).session_id()
+    }
+
+    #[inline]
+    fn poll_recv(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        recv_buf: &mut [u8],
+    ) -> Poll<Result<Range<usize>, crate::Error>> {
+        Pin::new(&mut **self).poll_recv(cx, recv_buf)
+    }
+
+    #[inline]
+    fn poll_send_ready(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        payload_length: u32,
+    ) -> Poll<Result<(), crate::Error>> {
+        Pin::new(&mut **self).poll_send_ready(cx, payload_length)
+    }
+
+    #[inline]
+    fn start_send<F>(mut self: Pin<&mut Self>, filler: F) -> Result<(), crate::Error>
+    where
+        F: FnOnce(&mut dyn BufMut),
+    {
+        Pin::new(&mut **self).start_send(filler)
+    }
+
+    #[inline]
+    fn poll_send<B>(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        payload: &mut B,
+    ) -> Poll<Result<(), crate::Error>>
+    where
+        B: Buf,
+    {
+        Pin::new(&mut **self).poll_send(cx, payload)
+    }
+
+    #[inline]
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), crate::Error>> {
+        Pin::new(&mut **self).poll_flush(cx)
+    }
+}
+
+impl<P> Transport for Pin<P>
+where
+    P: DerefMut + Unpin,
+    P::Target: Transport,
+{
+    #[inline]
+    fn poll_handshake(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), crate::Error>> {
+        self.get_mut().as_mut().poll_handshake(cx)
+    }
+
+    #[inline]
+    fn session_id(&self) -> &[u8] {
+        (**self).session_id()
+    }
+
+    #[inline]
+    fn poll_recv(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        recv_buf: &mut [u8],
+    ) -> Poll<Result<Range<usize>, crate::Error>> {
+        self.get_mut().as_mut().poll_recv(cx, recv_buf)
+    }
+
+    #[inline]
+    fn poll_send_ready(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        payload_length: u32,
+    ) -> Poll<Result<(), crate::Error>> {
+        self.get_mut().as_mut().poll_send_ready(cx, payload_length)
+    }
+
+    #[inline]
+    fn start_send<F>(self: Pin<&mut Self>, filler: F) -> Result<(), crate::Error>
+    where
+        F: FnOnce(&mut dyn BufMut),
+    {
+        self.get_mut().as_mut().start_send(filler)
+    }
+
+    #[inline]
+    fn poll_send<B>(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        payload: &mut B,
+    ) -> Poll<Result<(), crate::Error>>
+    where
+        B: Buf,
+    {
+        self.get_mut().as_mut().poll_send(cx, payload)
+    }
+
+    #[inline]
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), crate::Error>> {
+        self.get_mut().as_mut().poll_flush(cx)
+    }
 }
