@@ -600,10 +600,7 @@ impl SendPacket {
 
         buf[..4].copy_from_slice(&(packet_length as u32).to_be_bytes());
         buf[4] = padding_length as u8;
-        unsafe {
-            let padding = &mut buf[5 + payload_length..5 + payload_length + padding_length];
-            std::ptr::write_bytes(padding.as_mut_ptr(), 0, padding.len());
-        }
+        buf[5 + payload_length..5 + payload_length + padding_length].fill(0);
 
         tracing::trace!("encrypt packet");
         {
@@ -649,10 +646,7 @@ impl SendPacket {
                     ready!(stream.as_mut().poll_flush(cx)).map_err(crate::Error::io)?;
 
                     // clear the previous ciphertext.
-                    unsafe {
-                        let slot = &mut self.buf[..self.filled];
-                        std::ptr::write_bytes(slot.as_mut_ptr(), 0u8, slot.len());
-                    }
+                    self.buf[..self.filled].fill(0);
 
                     self.state = SendPacketState::Buffering;
                     self.filled = 0;
