@@ -1,10 +1,4 @@
-mod consts;
-mod error;
-mod util;
+//! An SSH client library.
 
-pub mod agent;
-pub mod connection;
-pub mod transport;
-pub mod userauth;
-
-pub use crate::error::Error;
+pub mod crypto;
+pub mod hostauth;

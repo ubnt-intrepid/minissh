@@ -1,20 +1,21 @@
 [package]
-name = "minissh"
+name = "minissh2"
 version = "0.0.1-dev"
 publish = false
 authors = ["Yusuke Sasaki <yusuke.sasaki.nuem@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-byteorder = "1"
-bytes = "1"
-futures = "0.3"
-pin-project-lite = "0.2"
-ring = "0.16"
 thiserror = "1"
-tokio = { version = "1", features = [ "full" ] }
 tracing = "0.1"
 
 [dev-dependencies]
 anyhow = "1"
+minissh2-ring = { path = "minissh2-ring" }
 tracing-subscriber = "0.1"
+
+[workspace]
+members = [
+    ".",
+    "minissh2-ring",
+]
